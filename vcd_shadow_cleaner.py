@@ -26,7 +26,7 @@ import urllib3
 import os
 import time # Import the time module for delays
 from dataclasses import dataclass
-from typing import Optional, List, Tuple
+from typing import Optional, List, Set, Tuple
 from datetime import datetime
 
 import requests
@@ -819,7 +819,7 @@ def run_gui():
             super().__init__(parent)
             self._filters: dict[int, set[str]] = {}
 
-        def set_column_filter(self, col: int, allowed: set[str] | None):
+        def set_column_filter(self, col: int, allowed: Optional[Set[str]]):
             if allowed is None:
                 self._filters.pop(col, None)
             else:
@@ -845,11 +845,11 @@ def run_gui():
     class FilterPopupDialog(QDialog):
         """Excel-style multi-select filter popup for a column."""
 
-        def __init__(self, parent, title: str, all_values: list[str], checked_values: set[str] | None):
+        def __init__(self, parent, title: str, all_values: list[str], checked_values: Optional[Set[str]]):
             super().__init__(parent)
             self.setWindowTitle(f"Filter: {title}")
             self.setMinimumSize(280, 350)
-            self.result_set: set[str] | None = None
+            self.result_set: Optional[Set[str]] = None
 
             layout = QVBoxLayout(self)
 
