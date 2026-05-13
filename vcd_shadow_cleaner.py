@@ -785,7 +785,7 @@ def run_gui():
     try:
         from PySide6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-            QLabel, QLineEdit, QPushButton, QComboBox, QTableView,
+            QLabel, QLineEdit, QPushButton, QComboBox, QTreeView,
             QGroupBox, QFormLayout, QProgressBar,
             QMessageBox, QCheckBox, QTextEdit, QHeaderView,
             QFrame, QListWidget, QListWidgetItem,
@@ -804,12 +804,13 @@ def run_gui():
         return 1
 
     SHADOW_VM_ROLE = Qt.ItemDataRole.UserRole + 1
+    IS_GROUP_ROLE = Qt.ItemDataRole.UserRole + 2
     COL_CHECK = 0
-    COL_CATALOG = 1
-    COL_TEMPLATE = 2
+    COL_TEMPLATE = 1
+    COL_CATALOG = 2
     COL_VMNAME = 3
     COL_DATASTORE = 4
-    COLUMN_HEADERS = ["", "Catalog", "Parent Template", "Shadow VM Name", "Datastore"]
+    COLUMN_HEADERS = ["", "Parent Template", "Catalog", "Shadow VMs", "Datastore"]
     FILTERABLE_COLUMNS = {COL_CATALOG, COL_TEMPLATE, COL_DATASTORE}
 
     class ColumnFilterProxyModel(QSortFilterProxyModel):
@@ -905,14 +906,26 @@ def run_gui():
                     self.result_set.add(item.text())
             self.accept()
 
+    SORTABLE_COLUMNS = {COL_TEMPLATE, COL_CATALOG, COL_DATASTORE}
+
     class FilterHeaderView(QHeaderView):
-        """Header view that supports right-click filter menus on filterable columns."""
+        """Header view with a select-all checkbox in col 0, left-click sort, and right-click filters."""
         filter_requested = Signal(int)
+        select_all_clicked = Signal()
+        sort_requested = Signal(int)  # emits logical column index
 
         def __init__(self, orientation, parent=None):
             super().__init__(orientation, parent)
             self.setSectionsClickable(True)
             self._filtered_columns: set[int] = set()
+            self._check_state = Qt.CheckState.Unchecked  # header checkbox state
+            self._sort_col = -1
+            self._sort_asc = True
+
+        def set_sort_indicator(self, col: int, ascending: bool):
+            self._sort_col = col
+            self._sort_asc = ascending
+            self.viewport().update()
 
         def set_filtered(self, col: int, is_filtered: bool):
             if is_filtered:
@@ -921,9 +934,62 @@ def run_gui():
                 self._filtered_columns.discard(col)
             self.viewport().update()
 
+        def set_check_state(self, state: Qt.CheckState):
+            if self._check_state != state:
+                self._check_state = state
+                self.viewport().update()
+
+        def _checkbox_rect(self, logical_index: int):
+            """Return the bounding rect for the checkbox drawn in the given section."""
+            from PySide6.QtCore import QRect
+            x = self.sectionViewportPosition(logical_index)
+            w = self.sectionSize(logical_index)
+            h = self.height()
+            cb_size = 14
+            cx = x + (w - cb_size) // 2
+            cy = (h - cb_size) // 2
+            return QRect(cx, cy, cb_size, cb_size)
+
+        def paintSection(self, painter, rect, logical_index):
+            super().paintSection(painter, rect, logical_index)
+            if logical_index == COL_CHECK:
+                from PySide6.QtWidgets import QStyleOptionButton, QStyle
+                opt = QStyleOptionButton()
+                opt.rect = self._checkbox_rect(logical_index)
+                if self._check_state == Qt.CheckState.Checked:
+                    opt.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_On
+                elif self._check_state == Qt.CheckState.PartiallyChecked:
+                    opt.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_NoChange
+                else:
+                    opt.state = QStyle.StateFlag.State_Enabled | QStyle.StateFlag.State_Off
+                self.style().drawControl(QStyle.ControlElement.CE_CheckBox, opt, painter)
+            elif logical_index in SORTABLE_COLUMNS and logical_index == self._sort_col:
+                from PySide6.QtCore import QRect
+                arrow = "\u25B2" if self._sort_asc else "\u25BC"
+                x = self.sectionViewportPosition(logical_index)
+                w = self.sectionSize(logical_index)
+                h = self.height()
+                painter.save()
+                painter.setPen(self.palette().color(self.palette().ColorRole.HighlightedText
+                                                    if self.currentIndex() == logical_index
+                                                    else self.palette().ColorRole.WindowText))
+                painter.drawText(QRect(x + w - 18, 0, 16, h),
+                                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                                 arrow)
+                painter.restore()
+
         def mousePressEvent(self, event):
+            logical = self.logicalIndexAt(event.pos())
+            if event.button() == Qt.MouseButton.LeftButton:
+                if logical == COL_CHECK:
+                    cb_rect = self._checkbox_rect(logical)
+                    if cb_rect.contains(event.pos()):
+                        self.select_all_clicked.emit()
+                        return
+                elif logical in SORTABLE_COLUMNS:
+                    self.sort_requested.emit(logical)
+                    return
             if event.button() == Qt.MouseButton.RightButton:
-                logical = self.logicalIndexAt(event.pos())
                 if logical in FILTERABLE_COLUMNS:
                     menu = QMenu(self)
                     col = logical
@@ -993,6 +1059,9 @@ def run_gui():
             self.shadow_vms: List[ShadowVM] = []
             self.worker: Optional[WorkerThread] = None
             self._select_all_state = False
+            self._active_filters: dict[int, set[str]] = {}
+            self._sort_col = -1
+            self._sort_asc = True
 
             self.init_ui()
             self.reset_connection_ui()
@@ -1158,38 +1227,50 @@ def run_gui():
             filter_row.addWidget(clear_all_btn)
 
             filter_row.addStretch()
+
+            expand_all_btn = QPushButton("Expand All")
+            expand_all_btn.setMaximumHeight(24)
+            expand_all_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            expand_all_btn.clicked.connect(lambda: self.results_table.expandAll())
+            filter_row.addWidget(expand_all_btn)
+
+            collapse_all_btn = QPushButton("Collapse All")
+            collapse_all_btn.setMaximumHeight(24)
+            collapse_all_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            collapse_all_btn.clicked.connect(lambda: self.results_table.collapseAll())
+            filter_row.addWidget(collapse_all_btn)
+
             results_layout.addLayout(filter_row)
 
-            # Source model
-            self._source_model = QStandardItemModel(0, len(COLUMN_HEADERS))
-            self._source_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
+            # Tree model (tree structure: group rows = templates, child rows = shadow VMs)
+            self._tree_model = QStandardItemModel(0, len(COLUMN_HEADERS))
+            self._tree_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
 
-            # Proxy model for filtering
-            self._proxy_model = ColumnFilterProxyModel()
-            self._proxy_model.setSourceModel(self._source_model)
-            self._proxy_model.setDynamicSortFilter(True)
-
-            # Table view
-            self.results_table = QTableView()
-            self.results_table.setModel(self._proxy_model)
+            # Tree view
+            self.results_table = QTreeView()
+            self.results_table.setModel(self._tree_model)
             self.results_table.setAlternatingRowColors(True)
+            self.results_table.setSortingEnabled(False)
+            self.results_table.setUniformRowHeights(True)
+            self.results_table.setItemsExpandable(True)
+            self.results_table.setRootIsDecorated(True)
             self.results_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-            self.results_table.setSortingEnabled(True)
-            self.results_table.verticalHeader().setVisible(False)
+            self.results_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
 
-            # Custom header
+            # Custom header with select-all checkbox in col 0
             header = FilterHeaderView(Qt.Orientation.Horizontal, self.results_table)
-            self.results_table.setHorizontalHeader(header)
+            self.results_table.setHeader(header)
             header.setSectionsClickable(True)
-            header.sectionClicked.connect(self._on_header_clicked)
             header.filter_requested.connect(self._on_filter_requested)
+            header.select_all_clicked.connect(self._on_header_select_all_clicked)
+            header.sort_requested.connect(self._on_sort_requested)
 
             header.setSectionResizeMode(COL_CHECK, QHeaderView.ResizeMode.Fixed)
             self.results_table.setColumnWidth(COL_CHECK, 40)
-            for c in (COL_CATALOG, COL_TEMPLATE, COL_VMNAME, COL_DATASTORE):
+            for c in (COL_TEMPLATE, COL_CATALOG, COL_VMNAME, COL_DATASTORE):
                 header.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
 
-            self._source_model.itemChanged.connect(self._on_item_changed)
+            self._tree_model.itemChanged.connect(self._on_item_changed)
 
             results_layout.addWidget(self.results_table)
             results_group.setLayout(results_layout)
@@ -1220,66 +1301,194 @@ def run_gui():
             self.log_text.append(f"[{timestamp}] {message}")
 
         def _get_all_column_values(self, col: int) -> list[str]:
-            """Collect all unique values from the source model for a column."""
+            """Collect unique values for a filterable column.
+            Template/Catalog/Datastore filters operate at the group level."""
             values = []
-            for row in range(self._source_model.rowCount()):
-                item = self._source_model.item(row, col)
-                if item:
-                    values.append(item.text())
+            for group_row in range(self._tree_model.rowCount()):
+                cell = self._tree_model.item(group_row, col)
+                if cell:
+                    values.append(cell.text())
             return values
 
-        def _on_header_clicked(self, logical_index: int):
-            if logical_index == COL_CHECK:
-                self._toggle_all_visible_checkboxes()
+        def _iter_visible_child_check_items(self):
+            """Yield check items (col 0) for child rows that pass active filters."""
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                if not self.results_table.isRowHidden(group_row, self._tree_model.invisibleRootItem().index()):
+                    for child_row in range(group_item.rowCount()):
+                        child_chk = group_item.child(child_row, COL_CHECK)
+                        if child_chk and not self.results_table.isRowHidden(
+                            child_row, group_item.index()
+                        ):
+                            yield child_chk
 
-        def _toggle_all_visible_checkboxes(self):
-            self._select_all_state = not self._select_all_state
-            new_check = Qt.CheckState.Checked if self._select_all_state else Qt.CheckState.Unchecked
-            self._source_model.blockSignals(True)
-            for proxy_row in range(self._proxy_model.rowCount()):
-                source_idx = self._proxy_model.mapToSource(self._proxy_model.index(proxy_row, COL_CHECK))
-                item = self._source_model.itemFromIndex(source_idx)
-                if item:
-                    item.setCheckState(new_check)
-            self._source_model.blockSignals(False)
+        def _on_header_select_all_clicked(self):
+            """Toggle all visible child rows when the header checkbox is clicked."""
+            # Determine next state: if anything is unchecked, check all; otherwise uncheck all
+            header = self.results_table.header()
+            current = header._check_state
+            if current == Qt.CheckState.Checked:
+                new_check = Qt.CheckState.Unchecked
+            else:
+                new_check = Qt.CheckState.Checked
+            self._select_all_state = (new_check == Qt.CheckState.Checked)
+            root_idx = self._tree_model.invisibleRootItem().index()
+            self._tree_model.blockSignals(True)
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                if self.results_table.isRowHidden(group_row, root_idx):
+                    continue
+                for child_row in range(group_item.rowCount()):
+                    child_chk = group_item.child(child_row, COL_CHECK)
+                    if child_chk:
+                        child_chk.setCheckState(new_check)
+                self._update_group_checkbox(group_item)
+            self._tree_model.blockSignals(False)
+            self._update_selected_count()
+            self._update_header_check_state()
+
+        def _on_group_checkbox_clicked(self, group_item: QStandardItem):
+            """When a group-row checkbox is toggled, apply state to all children."""
+            new_check = group_item.checkState()
+            # If the new state is PartiallyChecked (from a user click cycling tri-state),
+            # treat it as Checked so clicking always goes to a definite state.
+            if new_check == Qt.CheckState.PartiallyChecked:
+                new_check = Qt.CheckState.Checked
+                self._tree_model.blockSignals(True)
+                group_item.setCheckState(new_check)
+                self._tree_model.blockSignals(False)
+            self._tree_model.blockSignals(True)
+            for child_row in range(group_item.rowCount()):
+                child_chk = group_item.child(child_row, COL_CHECK)
+                if child_chk:
+                    child_chk.setCheckState(new_check)
+            self._tree_model.blockSignals(False)
             self._update_selected_count()
 
+        def _update_group_checkbox(self, group_item: QStandardItem):
+            """Sync group row checkbox to reflect its children's checked state."""
+            total = 0
+            checked = 0
+            for child_row in range(group_item.rowCount()):
+                child_chk = group_item.child(child_row, COL_CHECK)
+                if child_chk:
+                    total += 1
+                    if child_chk.checkState() == Qt.CheckState.Checked:
+                        checked += 1
+            if total == 0:
+                group_item.setCheckState(Qt.CheckState.Unchecked)
+            elif checked == total:
+                group_item.setCheckState(Qt.CheckState.Checked)
+            elif checked > 0:
+                group_item.setCheckState(Qt.CheckState.PartiallyChecked)
+            else:
+                group_item.setCheckState(Qt.CheckState.Unchecked)
+
+        def _on_sort_requested(self, col: int):
+            """Sort top-level group rows by the given column; toggle asc/desc on repeat click."""
+            if self._sort_col == col:
+                self._sort_asc = not self._sort_asc
+            else:
+                self._sort_col = col
+                self._sort_asc = True
+            self._sort_groups()
+            self.results_table.header().set_sort_indicator(self._sort_col, self._sort_asc)
+
+        def _sort_groups(self):
+            """Re-order top-level rows in the tree model by the current sort column/direction."""
+            if self._sort_col < 0:
+                return
+            model = self._tree_model
+            tree = self.results_table
+
+            # Remember which groups were expanded (by their template name text)
+            expanded = set()
+            for r in range(model.rowCount()):
+                idx = model.index(r, 0)
+                if tree.isExpanded(idx):
+                    item = model.item(r, COL_TEMPLATE)
+                    if item:
+                        expanded.add(item.text())
+
+            # Collapse all so takeRow is safe (children stay on their QStandardItem parent)
+            tree.collapseAll()
+
+            model.blockSignals(True)
+            num_rows = model.rowCount()
+            # takeRow removes the row from the model but children remain attached to the
+            # QStandardItem (col-0 item) which travels with the row list.
+            all_rows = [model.takeRow(0) for _ in range(num_rows)]
+            col = self._sort_col
+            all_rows.sort(
+                key=lambda row_items: (row_items[col].text().lower() if row_items[col] else ""),
+                reverse=not self._sort_asc
+            )
+            for row_items in all_rows:
+                model.appendRow(row_items)
+            model.blockSignals(False)
+
+            # Re-expand any groups that were open before the sort
+            for r in range(model.rowCount()):
+                item = model.item(r, COL_TEMPLATE)
+                if item and item.text() in expanded:
+                    tree.expand(model.index(r, 0))
+
         def _on_filter_requested(self, col_signal: int):
-            header = self.results_table.horizontalHeader()
+            header = self.results_table.header()
             if col_signal <= 0:
                 col = -col_signal
-                self._proxy_model.set_column_filter(col, None)
+                self._active_filters.pop(col, None)
                 header.set_filtered(col, False)
                 self._update_filter_button(col, False)
+                self._apply_filters()
                 self._update_summary()
                 return
 
             col = col_signal
             all_values = self._get_all_column_values(col)
-            current_filters = self._proxy_model.active_filters()
-            current_checked = current_filters.get(col)
+            current_checked = self._active_filters.get(col)
 
             dlg = FilterPopupDialog(self, COLUMN_HEADERS[col], all_values, current_checked)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 result = dlg.result_set
                 if result is None:
-                    self._proxy_model.set_column_filter(col, None)
+                    self._active_filters.pop(col, None)
                     header.set_filtered(col, False)
                     self._update_filter_button(col, False)
                 else:
                     all_unique = set(all_values)
                     is_filtered = result != all_unique
-                    self._proxy_model.set_column_filter(col, result)
+                    self._active_filters[col] = result
                     header.set_filtered(col, is_filtered)
                     self._update_filter_button(col, is_filtered)
+                self._apply_filters()
                 self._update_summary()
 
+        def _apply_filters(self):
+            """Show/hide group rows based on active filters (filters operate at group level)."""
+            root_idx = self._tree_model.invisibleRootItem().index()
+            for group_row in range(self._tree_model.rowCount()):
+                group_visible = True
+                for col, allowed in self._active_filters.items():
+                    cell = self._tree_model.item(group_row, col)
+                    val = cell.text() if cell else ""
+                    if val not in allowed:
+                        group_visible = False
+                        break
+                self.results_table.setRowHidden(group_row, root_idx, not group_visible)
+            self._update_header_check_state()
+
         def _clear_all_filters(self):
-            self._proxy_model.clear_all_filters()
-            header = self.results_table.horizontalHeader()
+            self._active_filters.clear()
+            header = self.results_table.header()
             for c in FILTERABLE_COLUMNS:
                 header.set_filtered(c, False)
                 self._update_filter_button(c, False)
+            self._apply_filters()
             self._update_summary()
 
         def _update_filter_button(self, col: int, is_filtered: bool):
@@ -1294,24 +1503,73 @@ def run_gui():
                     btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
 
         def _on_item_changed(self, item: QStandardItem):
-            if item.column() == COL_CHECK:
+            if item.column() != COL_CHECK:
+                return
+            is_group = item.data(IS_GROUP_ROLE)
+            if is_group:
+                self._on_group_checkbox_clicked(item)
+            else:
+                # Child checkbox changed: update parent group checkbox
+                parent = item.parent()
+                if parent:
+                    self._tree_model.blockSignals(True)
+                    self._update_group_checkbox(parent)
+                    self._tree_model.blockSignals(False)
                 self._update_selected_count()
+                self._update_header_check_state()
 
         def _update_selected_count(self):
             selected = 0
-            for row in range(self._source_model.rowCount()):
-                chk = self._source_model.item(row, COL_CHECK)
-                if chk and chk.checkState() == Qt.CheckState.Checked:
-                    selected += 1
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                for child_row in range(group_item.rowCount()):
+                    child_chk = group_item.child(child_row, COL_CHECK)
+                    if child_chk and child_chk.checkState() == Qt.CheckState.Checked:
+                        selected += 1
             self.statusBar().showMessage(f"Selected Shadow VMs: {selected}")
 
-        def _update_summary(self):
-            total = self._source_model.rowCount()
-            visible = self._proxy_model.rowCount()
-            if total == visible:
-                self.summary_label.setText(f"Found {total} Shadow VMs")
+        def _update_header_check_state(self):
+            """Sync the header checkbox in col 0 to reflect visible child row states."""
+            total_visible = 0
+            total_checked = 0
+            root_idx = self._tree_model.invisibleRootItem().index()
+            for group_row in range(self._tree_model.rowCount()):
+                if self.results_table.isRowHidden(group_row, root_idx):
+                    continue
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                for child_row in range(group_item.rowCount()):
+                    child_chk = group_item.child(child_row, COL_CHECK)
+                    if child_chk:
+                        total_visible += 1
+                        if child_chk.checkState() == Qt.CheckState.Checked:
+                            total_checked += 1
+            if total_visible == 0 or total_checked == 0:
+                self.results_table.header().set_check_state(Qt.CheckState.Unchecked)
+            elif total_checked == total_visible:
+                self.results_table.header().set_check_state(Qt.CheckState.Checked)
             else:
-                self.summary_label.setText(f"Showing {visible} of {total} Shadow VMs (filtered)")
+                self.results_table.header().set_check_state(Qt.CheckState.PartiallyChecked)
+
+        def _update_summary(self):
+            total_vms = 0
+            visible_vms = 0
+            root_idx = self._tree_model.invisibleRootItem().index()
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                count = group_item.rowCount()
+                total_vms += count
+                if not self.results_table.isRowHidden(group_row, root_idx):
+                    visible_vms += count
+            if total_vms == visible_vms:
+                self.summary_label.setText(f"Found {total_vms} Shadow VMs")
+            else:
+                self.summary_label.setText(f"Showing {visible_vms} of {total_vms} Shadow VMs (filtered)")
 
         # ---- auth toggles ----
 
@@ -1416,13 +1674,14 @@ def run_gui():
             self.scan_btn.setEnabled(False)
             self.cleanup_btn.setEnabled(False)
 
-            self._source_model.removeRows(0, self._source_model.rowCount())
-            self._proxy_model.clear_all_filters()
-            header = self.results_table.horizontalHeader()
+            self._tree_model.removeRows(0, self._tree_model.rowCount())
+            self._active_filters.clear()
+            header = self.results_table.header()
             for c in FILTERABLE_COLUMNS:
                 header.set_filtered(c, False)
                 self._update_filter_button(c, False)
             self._select_all_state = False
+            self.results_table.header().set_check_state(Qt.CheckState.Unchecked)
             self.summary_label.setText("No scan performed yet.")
 
         # ---- dropdowns ----
@@ -1530,48 +1789,103 @@ def run_gui():
                 self.client, selected_catalogs, datastore_name, debug=False
             )
 
-            # Clear filters and rebuild model
-            self._proxy_model.clear_all_filters()
-            header = self.results_table.horizontalHeader()
+            # Clear filters, sort state, and rebuild model
+            self._active_filters.clear()
+            self._sort_col = -1
+            self._sort_asc = True
+            header = self.results_table.header()
             for c in FILTERABLE_COLUMNS:
                 header.set_filtered(c, False)
                 self._update_filter_button(c, False)
+            header.set_sort_indicator(-1, True)
             self._select_all_state = False
 
-            self._source_model.removeRows(0, self._source_model.rowCount())
+            self._tree_model.blockSignals(True)
+            self._tree_model.removeRows(0, self._tree_model.rowCount())
 
-            sorted_shadows = sorted(
-                self.shadow_vms,
-                key=lambda s: (s.catalog_name.lower(), s.container_name.lower() if s.container_name else '')
-            )
+            # Group shadows by (template_name, catalog_name)
+            from collections import defaultdict
+            groups: dict[tuple, list] = defaultdict(list)
+            for shadow in self.shadow_vms:
+                key = (
+                    shadow.container_name.lower() if shadow.container_name else '',
+                    shadow.catalog_name.lower()
+                )
+                groups[key].append(shadow)
 
-            for shadow in sorted_shadows:
-                chk_item = QStandardItem()
-                chk_item.setCheckable(True)
-                chk_item.setCheckState(Qt.CheckState.Unchecked)
-                chk_item.setEditable(False)
+            for key in sorted(groups.keys()):
+                group_shadows = groups[key]
+                first = group_shadows[0]
+                template_name = first.container_name or "(unknown)"
+                catalog_name = first.catalog_name
+                datastore_name = first.datastore_name
+                vm_count = len(group_shadows)
 
-                cat_item = QStandardItem(shadow.catalog_name)
-                cat_item.setData(shadow, SHADOW_VM_ROLE)
-                cat_item.setEditable(False)
+                # Group row: template name (bold), catalog, VM count, datastore
+                grp_chk = QStandardItem()
+                grp_chk.setCheckable(True)
+                grp_chk.setCheckState(Qt.CheckState.Unchecked)
+                grp_chk.setEditable(False)
+                grp_chk.setData(True, IS_GROUP_ROLE)
+                grp_chk.setFlags(
+                    grp_chk.flags()
+                    | Qt.ItemFlag.ItemIsUserTristate
+                )
 
-                tpl_item = QStandardItem(shadow.container_name)
-                tpl_item.setEditable(False)
+                grp_tpl = QStandardItem(template_name)
+                grp_tpl.setEditable(False)
+                grp_tpl.setData(True, IS_GROUP_ROLE)
+                font = grp_tpl.font()
+                font.setBold(True)
+                grp_tpl.setFont(font)
 
-                vm_item = QStandardItem(shadow.name)
-                vm_item.setEditable(False)
+                grp_cat = QStandardItem(catalog_name)
+                grp_cat.setEditable(False)
+                grp_cat.setData(True, IS_GROUP_ROLE)
 
-                ds_item = QStandardItem(shadow.datastore_name)
-                ds_item.setEditable(False)
+                grp_vm = QStandardItem(str(vm_count))
+                grp_vm.setEditable(False)
+                grp_vm.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-                self._source_model.appendRow([chk_item, cat_item, tpl_item, vm_item, ds_item])
+                grp_ds = QStandardItem(datastore_name)
+                grp_ds.setEditable(False)
 
-            self._source_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
+                self._tree_model.appendRow([grp_chk, grp_tpl, grp_cat, grp_vm, grp_ds])
+
+                # Child rows: VM name (indented) in COL_TEMPLATE, datastore filled in, catalog blank
+                for shadow in sorted(group_shadows, key=lambda s: s.name.lower()):
+                    chk_item = QStandardItem()
+                    chk_item.setCheckable(True)
+                    chk_item.setCheckState(Qt.CheckState.Unchecked)
+                    chk_item.setEditable(False)
+                    chk_item.setData(False, IS_GROUP_ROLE)
+
+                    tpl_item = QStandardItem("  " + shadow.name)
+                    tpl_item.setEditable(False)
+
+                    cat_item = QStandardItem("")
+                    cat_item.setData(shadow, SHADOW_VM_ROLE)
+                    cat_item.setEditable(False)
+
+                    vm_item = QStandardItem("")
+                    vm_item.setEditable(False)
+
+                    ds_item = QStandardItem(shadow.datastore_name)
+                    ds_item.setEditable(False)
+
+                    grp_chk.appendRow([chk_item, tpl_item, cat_item, vm_item, ds_item])
+
+            self._tree_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
+            self._tree_model.blockSignals(False)
+
+            # Collapse all groups by default
+            self.results_table.collapseAll()
 
             self.summary_label.setText(f"Found {len(self.shadow_vms)} Shadow VMs")
             self.progress_bar.setVisible(False)
             self.scan_btn.setEnabled(True)
             self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
+            self.results_table.header().set_check_state(Qt.CheckState.Unchecked)
             self.statusBar().showMessage(f"Scan complete: {len(self.shadow_vms)} Shadow VMs found")
             self.log(f"Scan complete: {len(self.shadow_vms)} Shadow VMs")
             self._update_selected_count()
@@ -1583,14 +1897,18 @@ def run_gui():
                 return
 
             selected_shadow_vms = []
-            for row in range(self._source_model.rowCount()):
-                chk = self._source_model.item(row, COL_CHECK)
-                if chk and chk.checkState() == Qt.CheckState.Checked:
-                    cat_item = self._source_model.item(row, COL_CATALOG)
-                    if cat_item:
-                        shadow = cat_item.data(SHADOW_VM_ROLE)
-                        if shadow:
-                            selected_shadow_vms.append(shadow)
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                for child_row in range(group_item.rowCount()):
+                    child_chk = group_item.child(child_row, COL_CHECK)
+                    if child_chk and child_chk.checkState() == Qt.CheckState.Checked:
+                        cat_cell = group_item.child(child_row, COL_CATALOG)
+                        if cat_cell:
+                            shadow = cat_cell.data(SHADOW_VM_ROLE)
+                            if shadow:
+                                selected_shadow_vms.append(shadow)
 
             if not selected_shadow_vms:
                 QMessageBox.information(self, "No Selection", "No Shadow VMs selected for deletion.")
@@ -1635,16 +1953,27 @@ def run_gui():
                 if i < len(selected_shadow_vms) - 1:
                     time.sleep(3)
 
-            # Remove deleted rows from source model (reverse to preserve indices)
-            rows_to_remove = []
-            for row in range(self._source_model.rowCount()):
-                cat_item = self._source_model.item(row, COL_CATALOG)
-                if cat_item:
-                    s = cat_item.data(SHADOW_VM_ROLE)
-                    if s and id(s) in deleted_shadows:
-                        rows_to_remove.append(row)
-            for row in reversed(rows_to_remove):
-                self._source_model.removeRow(row)
+            # Remove deleted child rows from tree model; remove empty group rows
+            self._tree_model.blockSignals(True)
+            group_rows_to_remove = []
+            for group_row in range(self._tree_model.rowCount()):
+                group_item = self._tree_model.item(group_row, 0)
+                if group_item is None:
+                    continue
+                child_rows_to_remove = []
+                for child_row in range(group_item.rowCount()):
+                    cat_cell = group_item.child(child_row, COL_CATALOG)
+                    if cat_cell:
+                        s = cat_cell.data(SHADOW_VM_ROLE)
+                        if s and id(s) in deleted_shadows:
+                            child_rows_to_remove.append(child_row)
+                for child_row in reversed(child_rows_to_remove):
+                    group_item.removeRow(child_row)
+                if group_item.rowCount() == 0:
+                    group_rows_to_remove.append(group_row)
+            for group_row in reversed(group_rows_to_remove):
+                self._tree_model.removeRow(group_row)
+            self._tree_model.blockSignals(False)
 
             self.shadow_vms = [s for s in self.shadow_vms if id(s) not in deleted_shadows]
 
