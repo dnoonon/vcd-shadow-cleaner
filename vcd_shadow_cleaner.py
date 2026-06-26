@@ -24,7 +24,6 @@ import sys
 import json
 import urllib3
 import os
-import time # Import the time module for delays
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime
@@ -578,14 +577,14 @@ class VCDClient:
             self.current_org = None
 
 
-def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_name: str, debug: bool = True) -> List[ShadowVM]:
+def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_names, debug: bool = True) -> List[ShadowVM]:
     """
-    Scan for Shadow VMs on a datastore that belong to templates in one or more catalogs.
+    Scan for Shadow VMs on one or more datastores that belong to templates in one or more catalogs.
 
     Args:
         client: Authenticated VCDClient
         catalog_names: List of catalog names (or a single name) to scan
-        datastore_name: Datastore to scan for shadow VMs
+        datastore_names: List of datastore names (or a single name) to scan for shadow VMs
         debug: Enable debug output
 
     Returns:
@@ -593,10 +592,12 @@ def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_name:
     """
     if isinstance(catalog_names, str):
         catalog_names = [catalog_names]
+    if isinstance(datastore_names, str):
+        datastore_names = [datastore_names]
 
     print(f"\nScanning for Shadow VMs...")
     print(f"  Catalogs: {', '.join(catalog_names)}")
-    print(f"  Datastore: {datastore_name}")
+    print(f"  Datastores: {', '.join(datastore_names)}")
 
     # Build combined lookup structures across all catalogs
     # Maps template HREF/ID -> (template_name, catalog_name)
@@ -620,8 +621,12 @@ def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_name:
 
     template_names = set(template_name_to_catalog.keys())
 
-    all_shadows = client.get_shadow_vms_on_datastore(datastore_name, debug=debug)
-    print(f"  Found {len(all_shadows)} Shadow VMs on datastore")
+    all_shadows = []
+    for ds_name in datastore_names:
+        ds_shadows = client.get_shadow_vms_on_datastore(ds_name, debug=debug)
+        print(f"  Found {len(ds_shadows)} Shadow VMs on datastore '{ds_name}'")
+        all_shadows.extend(ds_shadows)
+    print(f"  Found {len(all_shadows)} Shadow VMs across {len(datastore_names)} datastore(s)")
 
     if debug and all_shadows:
         print(f"  DEBUG: Sample Shadow VM container_names: {[s.container_name for s in all_shadows[:5]]}")
@@ -734,9 +739,10 @@ def run_cli(args):
         print(f"Switching to tenant: {args.tenant}")
         client.switch_to_org(args.tenant)
     
-    # Scan for Shadow VMs (support comma-separated catalog names from CLI)
+    # Scan for Shadow VMs (support comma-separated catalog and datastore names from CLI)
     catalog_names = [c.strip() for c in args.catalog.split(",")]
-    shadows = scan_shadow_vms(client, catalog_names, args.datastore)
+    datastore_names = [d.strip() for d in args.datastore.split(",")]
+    shadows = scan_shadow_vms(client, catalog_names, datastore_names)
     
     # Print results
     print_shadow_vm_table(shadows)
@@ -789,7 +795,8 @@ def run_gui():
             QGroupBox, QFormLayout, QProgressBar,
             QMessageBox, QCheckBox, QTextEdit, QHeaderView,
             QFrame, QListWidget, QListWidgetItem,
-            QDialog, QDialogButtonBox, QAbstractItemView, QMenu
+            QDialog, QDialogButtonBox, QAbstractItemView, QMenu,
+            QFileDialog
         )
         from PySide6.QtCore import (
             Qt, QThread, Signal, QSortFilterProxyModel, QModelIndex
@@ -906,7 +913,8 @@ def run_gui():
                     self.result_set.add(item.text())
             self.accept()
 
-    SORTABLE_COLUMNS = {COL_TEMPLATE, COL_CATALOG, COL_DATASTORE}
+    SORTABLE_COLUMNS = {COL_TEMPLATE, COL_CATALOG, COL_VMNAME, COL_DATASTORE}
+    NUMERIC_COLUMNS = {COL_VMNAME}
 
     class FilterHeaderView(QHeaderView):
         """Header view with a select-all checkbox in col 0, left-click sort, and right-click filters."""
@@ -1053,6 +1061,35 @@ def run_gui():
                 else:
                     self.finished.emit(False, error_message)
 
+        class DeleteWorker(QThread):
+            """Background worker that deletes shadow VMs with a delay between each."""
+            progress = Signal(int, int, str)        # current, total, name
+            item_done = Signal(object, bool, str)   # shadow, success, message
+            finished = Signal(int, int)             # success_count, fail_count
+
+            def __init__(self, parent, client, shadows, delay_seconds=3):
+                super().__init__(parent)
+                self.client = client
+                self.shadows = shadows
+                self.delay_seconds = delay_seconds
+
+            def run(self):
+                success_count = 0
+                fail_count = 0
+                total = len(self.shadows)
+                for i, shadow in enumerate(self.shadows):
+                    self.progress.emit(i + 1, total, shadow.name)
+                    success, message = self.client.delete_shadow_vm(shadow)
+                    self.item_done.emit(shadow, success, message)
+                    if success:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+                    # Rate-limit between deletes (skip after the last one)
+                    if i < total - 1:
+                        self.msleep(int(self.delay_seconds * 1000))
+                self.finished.emit(success_count, fail_count)
+
         def __init__(self):
             super().__init__()
             self.client: Optional[VCDClient] = None
@@ -1174,9 +1211,31 @@ def run_gui():
             catalog_widget.setLayout(catalog_container)
             select_layout.addRow("Catalog(s):", catalog_widget)
 
-            self.datastore_combo = QComboBox()
-            self.datastore_combo.setEnabled(False)
-            select_layout.addRow("Datastore:", self.datastore_combo)
+            datastore_container = QVBoxLayout()
+            datastore_btn_row = QHBoxLayout()
+            datastore_btn_row.setSpacing(4)
+            self.datastore_select_all_btn = QPushButton("Select All")
+            self.datastore_select_all_btn.setMaximumHeight(22)
+            self.datastore_select_all_btn.setEnabled(False)
+            self.datastore_select_all_btn.clicked.connect(self._datastore_select_all)
+            self.datastore_deselect_all_btn = QPushButton("Deselect All")
+            self.datastore_deselect_all_btn.setMaximumHeight(22)
+            self.datastore_deselect_all_btn.setEnabled(False)
+            self.datastore_deselect_all_btn.clicked.connect(self._datastore_deselect_all)
+            datastore_btn_row.addWidget(self.datastore_select_all_btn)
+            datastore_btn_row.addWidget(self.datastore_deselect_all_btn)
+            datastore_btn_row.addStretch()
+            datastore_container.addLayout(datastore_btn_row)
+
+            self.datastore_list = QListWidget()
+            self.datastore_list.setEnabled(False)
+            self.datastore_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+            self.datastore_list.setMaximumHeight(120)
+            datastore_container.addWidget(self.datastore_list)
+
+            datastore_widget = QWidget()
+            datastore_widget.setLayout(datastore_container)
+            select_layout.addRow("Datastore(s):", datastore_widget)
 
             btn_layout = QHBoxLayout()
             self.scan_btn = QPushButton("Scan for Shadow VMs")
@@ -1239,6 +1298,21 @@ def run_gui():
             collapse_all_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
             collapse_all_btn.clicked.connect(lambda: self.results_table.collapseAll())
             filter_row.addWidget(collapse_all_btn)
+
+            export_btn = QPushButton("Export to CSV")
+            export_btn.setMaximumHeight(24)
+            export_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            export_menu = QMenu(export_btn)
+            export_menu.addAction(
+                "Export Templates & Shadow VMs",
+                lambda: self._export_csv(include_shadows=True),
+            )
+            export_menu.addAction(
+                "Export Templates Only",
+                lambda: self._export_csv(include_shadows=False),
+            )
+            export_btn.setMenu(export_menu)
+            filter_row.addWidget(export_btn)
 
             results_layout.addLayout(filter_row)
 
@@ -1423,10 +1497,17 @@ def run_gui():
             # QStandardItem (col-0 item) which travels with the row list.
             all_rows = [model.takeRow(0) for _ in range(num_rows)]
             col = self._sort_col
-            all_rows.sort(
-                key=lambda row_items: (row_items[col].text().lower() if row_items[col] else ""),
-                reverse=not self._sort_asc
-            )
+            if col in NUMERIC_COLUMNS:
+                def sort_key(row_items):
+                    text = row_items[col].text() if row_items[col] else ""
+                    try:
+                        return int(text)
+                    except (ValueError, TypeError):
+                        return -1
+            else:
+                def sort_key(row_items):
+                    return row_items[col].text().lower() if row_items[col] else ""
+            all_rows.sort(key=sort_key, reverse=not self._sort_asc)
             for row_items in all_rows:
                 model.appendRow(row_items)
             model.blockSignals(False)
@@ -1436,6 +1517,76 @@ def run_gui():
                 item = model.item(r, COL_TEMPLATE)
                 if item and item.text() in expanded:
                     tree.expand(model.index(r, 0))
+
+        def _export_csv(self, include_shadows: bool):
+            """Export the currently visible results to a CSV file.
+
+            include_shadows=True  -> one row per shadow VM (Parent Template, VM Name, Catalog, Datastore)
+            include_shadows=False -> one row per template group (Parent Template, Catalog, Shadow VMs, Datastore)
+            Honors active filters: hidden (filtered-out) groups are skipped.
+            """
+            import csv
+
+            if self._tree_model.rowCount() == 0:
+                QMessageBox.information(
+                    self, "No Data", "There are no results to export. Run a scan first."
+                )
+                return
+
+            default_name = "shadow_vms.csv" if include_shadows else "shadow_templates.csv"
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Export to CSV", default_name, "CSV Files (*.csv);;All Files (*)"
+            )
+            if not path:
+                return
+            if not path.lower().endswith(".csv"):
+                path += ".csv"
+
+            root_idx = self._tree_model.invisibleRootItem().index()
+            rows_written = 0
+            try:
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if include_shadows:
+                        writer.writerow(["Parent Template", "VM Name", "Catalog", "Datastore"])
+                    else:
+                        writer.writerow(["Parent Template", "Catalog", "Shadow VMs", "Datastore"])
+
+                    for group_row in range(self._tree_model.rowCount()):
+                        if self.results_table.isRowHidden(group_row, root_idx):
+                            continue
+                        grp_chk = self._tree_model.item(group_row, COL_CHECK)
+                        template_name = self._tree_model.item(group_row, COL_TEMPLATE).text()
+                        catalog_name = self._tree_model.item(group_row, COL_CATALOG).text()
+                        vm_count = self._tree_model.item(group_row, COL_VMNAME).text()
+                        datastore_name = self._tree_model.item(group_row, COL_DATASTORE).text()
+
+                        if include_shadows:
+                            for child_row in range(grp_chk.rowCount()):
+                                cat_item = grp_chk.child(child_row, COL_CATALOG)
+                                shadow = cat_item.data(SHADOW_VM_ROLE) if cat_item else None
+                                if shadow is not None:
+                                    vm_name = shadow.name
+                                    ds = shadow.datastore_name or datastore_name
+                                else:
+                                    tpl_item = grp_chk.child(child_row, COL_TEMPLATE)
+                                    vm_name = tpl_item.text().strip() if tpl_item else ""
+                                    ds = datastore_name
+                                writer.writerow([template_name, vm_name, catalog_name, ds])
+                                rows_written += 1
+                        else:
+                            writer.writerow([template_name, catalog_name, vm_count, datastore_name])
+                            rows_written += 1
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Failed to write CSV file:\n{e}")
+                self.log(f"CSV export failed: {e}")
+                return
+
+            self.log(f"Exported {rows_written} row(s) to {path}")
+            self.statusBar().showMessage(f"Exported {rows_written} row(s) to {path}")
+            QMessageBox.information(
+                self, "Export Complete", f"Exported {rows_written} row(s) to:\n{path}"
+            )
 
         def _on_filter_requested(self, col_signal: int):
             header = self.results_table.header()
@@ -1668,8 +1819,10 @@ def run_gui():
             self.catalog_list.setEnabled(False)
             self.catalog_select_all_btn.setEnabled(False)
             self.catalog_deselect_all_btn.setEnabled(False)
-            self.datastore_combo.clear()
-            self.datastore_combo.setEnabled(False)
+            self.datastore_list.clear()
+            self.datastore_list.setEnabled(False)
+            self.datastore_select_all_btn.setEnabled(False)
+            self.datastore_deselect_all_btn.setEnabled(False)
 
             self.scan_btn.setEnabled(False)
             self.cleanup_btn.setEnabled(False)
@@ -1690,29 +1843,54 @@ def run_gui():
             if not self.client:
                 return
 
-            self.log("Loading organizations...")
-            orgs = self.client.get_organizations()
+            self.log("Loading organizations, catalogs, and datastores...")
+            self.statusBar().showMessage("Loading...")
+            self.progress_bar.setVisible(True)
+            self.progress_bar.setRange(0, 0)
+            self.scan_btn.setEnabled(False)
+
+            def fetch(client):
+                return {
+                    "orgs": client.get_organizations(),
+                    "catalogs": client.get_catalogs(),
+                    "datastores": client.get_datastores(),
+                }
+
+            self.dropdown_worker = WorkerThread(fetch, self.client)
+            self.dropdown_worker.finished.connect(self._on_dropdowns_loaded)
+            self.dropdown_worker.error.connect(self._on_dropdowns_error)
+            self.dropdown_worker.start()
+
+        def _on_dropdowns_loaded(self, data):
+            self.progress_bar.setVisible(False)
+
+            orgs = data["orgs"]
+            self.tenant_combo.blockSignals(True)
             self.tenant_combo.clear()
             self.tenant_combo.addItem("-- Select Tenant --")
             for org in orgs:
                 self.tenant_combo.addItem(org["name"])
             self.tenant_combo.setEnabled(True)
+            self.tenant_combo.blockSignals(False)
+            self.log(f"Loaded {len(orgs)} organizations")
 
-            self.log("Loading catalogs...")
-            catalogs = self.client.get_catalogs()
-            self._populate_catalog_list(catalogs)
-            self.log(f"Loaded {len(catalogs)} catalogs")
+            self._populate_catalog_list(data["catalogs"])
+            self.log(f"Loaded {len(data['catalogs'])} catalogs")
 
-            self.log("Loading datastores...")
-            datastores = self.client.get_datastores()
-            self.datastore_combo.clear()
-            self.datastore_combo.addItem("-- Select Datastore --")
-            for ds in datastores:
-                self.datastore_combo.addItem(ds["name"])
-            self.datastore_combo.setEnabled(True)
+            self._populate_datastore_list(data["datastores"])
+            self.log(f"Loaded {len(data['datastores'])} datastores")
 
             self.scan_btn.setEnabled(True)
+            self.statusBar().showMessage("Ready to scan.")
             self.log("Ready to scan.")
+
+        def _on_dropdowns_error(self, error_message: str):
+            self.progress_bar.setVisible(False)
+            self.log(f"Failed to load selections: {error_message}")
+            self.statusBar().showMessage("Failed to load selections")
+            QMessageBox.critical(
+                self, "Error", f"Failed to load tenants/catalogs/datastores:\n{error_message}"
+            )
 
         def on_tenant_changed(self, tenant_name: str):
             if self.client and tenant_name and not tenant_name.startswith("--"):
@@ -1720,12 +1898,37 @@ def run_gui():
                 self.log(f"Switched to tenant: {tenant_name}")
                 self.log(f"Loading catalogs for tenant '{tenant_name}'...")
                 self.statusBar().showMessage(f"Loading catalogs for {tenant_name}...")
-                QApplication.processEvents()
+                self.catalog_list.setEnabled(False)
+                self.catalog_select_all_btn.setEnabled(False)
+                self.catalog_deselect_all_btn.setEnabled(False)
+                self.scan_btn.setEnabled(False)
+                self.progress_bar.setVisible(True)
+                self.progress_bar.setRange(0, 0)
 
-                catalogs = self.client.get_catalogs(org_name=tenant_name)
-                self._populate_catalog_list(catalogs)
-                self.log(f"Loaded {len(catalogs)} catalogs for tenant '{tenant_name}'")
-                self.statusBar().showMessage("Ready")
+                self.catalog_worker = WorkerThread(
+                    self.client.get_catalogs, org_name=tenant_name
+                )
+                self.catalog_worker.finished.connect(
+                    lambda catalogs, t=tenant_name: self._on_tenant_catalogs_loaded(catalogs, t)
+                )
+                self.catalog_worker.error.connect(self._on_tenant_catalogs_error)
+                self.catalog_worker.start()
+
+        def _on_tenant_catalogs_loaded(self, catalogs, tenant_name: str):
+            self.progress_bar.setVisible(False)
+            self._populate_catalog_list(catalogs)
+            self.log(f"Loaded {len(catalogs)} catalogs for tenant '{tenant_name}'")
+            self.statusBar().showMessage("Ready")
+            self.scan_btn.setEnabled(True)
+
+        def _on_tenant_catalogs_error(self, error_message: str):
+            self.progress_bar.setVisible(False)
+            self.scan_btn.setEnabled(True)
+            self.log(f"Failed to load catalogs: {error_message}")
+            self.statusBar().showMessage("Failed to load catalogs")
+            QMessageBox.critical(
+                self, "Error", f"Failed to load catalogs for tenant:\n{error_message}"
+            )
 
         def _populate_catalog_list(self, catalogs: list):
             self.catalog_list.clear()
@@ -1762,6 +1965,36 @@ def run_gui():
                     selected.append(item.data(Qt.ItemDataRole.UserRole))
             return selected
 
+        def _populate_datastore_list(self, datastores: list):
+            self.datastore_list.clear()
+            for ds in datastores:
+                vc_name = ds.get('vcName', '')
+                display_name = f"{ds['name']} ({vc_name})" if vc_name else ds['name']
+                item = QListWidgetItem(display_name)
+                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                item.setCheckState(Qt.CheckState.Unchecked)
+                item.setData(Qt.ItemDataRole.UserRole, ds['name'])
+                self.datastore_list.addItem(item)
+            self.datastore_list.setEnabled(True)
+            self.datastore_select_all_btn.setEnabled(True)
+            self.datastore_deselect_all_btn.setEnabled(True)
+
+        def _datastore_select_all(self):
+            for i in range(self.datastore_list.count()):
+                self.datastore_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+        def _datastore_deselect_all(self):
+            for i in range(self.datastore_list.count()):
+                self.datastore_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+        def _get_selected_datastore_names(self) -> list:
+            selected = []
+            for i in range(self.datastore_list.count()):
+                item = self.datastore_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    selected.append(item.data(Qt.ItemDataRole.UserRole))
+            return selected
+
         # ---- scan ----
 
         def scan_shadow_vms(self):
@@ -1773,21 +2006,42 @@ def run_gui():
                 QMessageBox.warning(self, "Error", "Please select at least one catalog.")
                 return
 
-            datastore_name = self.datastore_combo.currentText()
-            if not datastore_name or datastore_name.startswith("--"):
-                QMessageBox.warning(self, "Error", "Please select a datastore.")
+            selected_datastores = self._get_selected_datastore_names()
+            if not selected_datastores:
+                QMessageBox.warning(self, "Error", "Please select at least one datastore.")
                 return
 
-            self.log(f"Scanning {len(selected_catalogs)} catalog(s) on datastore '{datastore_name}'...")
+            self.log(
+                f"Scanning {len(selected_catalogs)} catalog(s) on "
+                f"{len(selected_datastores)} datastore(s): {', '.join(selected_datastores)}..."
+            )
             self.statusBar().showMessage("Scanning...")
             self.scan_btn.setEnabled(False)
+            self.cleanup_btn.setEnabled(False)
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
-            QApplication.processEvents()
 
-            self.shadow_vms = scan_shadow_vms(
-                self.client, selected_catalogs, datastore_name, debug=False
+            # Run the scan on a background thread so the UI stays responsive
+            # (no macOS spinning beachball).
+            self.scan_worker = WorkerThread(
+                scan_shadow_vms, self.client, selected_catalogs, selected_datastores, debug=False
             )
+            self.scan_worker.finished.connect(self._on_scan_finished)
+            self.scan_worker.error.connect(self._on_scan_error)
+            self.scan_worker.start()
+
+        def _on_scan_error(self, error_message: str):
+            self.progress_bar.setVisible(False)
+            self.scan_btn.setEnabled(True)
+            self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
+            self.log(f"Scan failed: {error_message}")
+            self.statusBar().showMessage("Scan failed")
+            QMessageBox.critical(
+                self, "Scan Error", f"Failed to scan for Shadow VMs:\n{error_message}"
+            )
+
+        def _on_scan_finished(self, shadow_vms):
+            self.shadow_vms = shadow_vms
 
             # Clear filters, sort state, and rebuild model
             self._active_filters.clear()
@@ -1803,13 +2057,16 @@ def run_gui():
             self._tree_model.blockSignals(True)
             self._tree_model.removeRows(0, self._tree_model.rowCount())
 
-            # Group shadows by (template_name, catalog_name)
+            # Group shadows by (template_name, catalog_name, datastore_name) so the same
+            # template on different datastores is shown as separate rows and the
+            # Datastore column filter works correctly.
             from collections import defaultdict
             groups: dict[tuple, list] = defaultdict(list)
             for shadow in self.shadow_vms:
                 key = (
                     shadow.container_name.lower() if shadow.container_name else '',
-                    shadow.catalog_name.lower()
+                    shadow.catalog_name.lower(),
+                    shadow.datastore_name.lower()
                 )
                 groups[key].append(shadow)
 
@@ -1932,26 +2189,28 @@ def run_gui():
             self.progress_bar.setRange(0, len(selected_shadow_vms))
             self.progress_bar.setValue(0)
 
-            success_count = 0
-            fail_count = 0
-            deleted_shadows = set()
+            # Run deletion on a background thread (it sleeps between deletes) so the
+            # UI stays responsive instead of showing the macOS spinning beachball.
+            self._deleted_shadow_ids = set()
+            self.delete_worker = self.DeleteWorker(self, self.client, selected_shadow_vms)
+            self.delete_worker.progress.connect(self._on_delete_progress)
+            self.delete_worker.item_done.connect(self._on_delete_item_done)
+            self.delete_worker.finished.connect(self._on_delete_finished)
+            self.delete_worker.start()
 
-            for i, shadow in enumerate(selected_shadow_vms):
-                self.progress_bar.setValue(i + 1)
-                self.statusBar().showMessage(f"Deleting {i+1}/{len(selected_shadow_vms)}: {shadow.name}")
-                QApplication.processEvents()
+        def _on_delete_progress(self, current: int, total: int, name: str):
+            self.progress_bar.setValue(current)
+            self.statusBar().showMessage(f"Deleting {current}/{total}: {name}")
 
-                success, message = self.client.delete_shadow_vm(shadow)
-                if success:
-                    self.log(f"Deleted: {shadow.name}")
-                    success_count += 1
-                    deleted_shadows.add(id(shadow))
-                else:
-                    self.log(f"Failed: {shadow.name} - {message}")
-                    fail_count += 1
+        def _on_delete_item_done(self, shadow, success: bool, message: str):
+            if success:
+                self.log(f"Deleted: {shadow.name}")
+                self._deleted_shadow_ids.add(id(shadow))
+            else:
+                self.log(f"Failed: {shadow.name} - {message}")
 
-                if i < len(selected_shadow_vms) - 1:
-                    time.sleep(3)
+        def _on_delete_finished(self, success_count: int, fail_count: int):
+            deleted_shadows = self._deleted_shadow_ids
 
             # Remove deleted child rows from tree model; remove empty group rows
             self._tree_model.blockSignals(True)
@@ -1991,6 +2250,13 @@ def run_gui():
             )
 
         def closeEvent(self, event):
+            # Wait for any running background worker so the app doesn't crash with
+            # "QThread: Destroyed while thread is still running".
+            for attr in ("connection_worker", "dropdown_worker", "catalog_worker",
+                         "scan_worker", "delete_worker"):
+                worker = getattr(self, attr, None)
+                if worker is not None and worker.isRunning():
+                    worker.wait()
             if self.client and self.client.access_token:
                 self.client.disconnect()
             event.accept()
