@@ -24,6 +24,20 @@ import sys
 import json
 import urllib3
 import os
+import time
+import uuid
+import base64
+
+try:
+    import keyring
+    _KEYRING_AVAILABLE = True
+except ImportError:
+    _KEYRING_AVAILABLE = False
+
+_CONFIG_DIR = os.path.expanduser("~/.vcd-shadow-cleaner")
+_SERVERS_FILE = os.path.join(_CONFIG_DIR, "servers.json")
+_KEYRING_SERVICE = "vcd-shadow-cleaner"
+
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 from datetime import datetime
@@ -65,6 +79,75 @@ def load_env_file(env_path: str = ".env"):
                         os.environ[key] = value
     except Exception as e:
         print(f"Warning: Failed to load .env file: {e}")
+
+
+def _load_saved_servers() -> list:
+    if not os.path.exists(_SERVERS_FILE):
+        return []
+    try:
+        with open(_SERVERS_FILE, "r") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _persist_saved_servers(servers: list) -> None:
+    os.makedirs(_CONFIG_DIR, exist_ok=True)
+    with open(_SERVERS_FILE, "w") as f:
+        json.dump(servers, f, indent=2)
+
+
+def _get_credential(server_id: str) -> str:
+    """Return stored password/token for a saved server, or empty string."""
+    if _KEYRING_AVAILABLE:
+        try:
+            result = keyring.get_password(_KEYRING_SERVICE, server_id)
+            return result or ""
+        except Exception:
+            return ""
+    # fallback: base64 in JSON
+    for s in _load_saved_servers():
+        if s.get("id") == server_id:
+            raw = s.get("_credential_b64", "")
+            if raw:
+                try:
+                    return base64.b64decode(raw.encode()).decode()
+                except Exception:
+                    return ""
+    return ""
+
+
+def _set_credential(server_id: str, credential: str) -> None:
+    """Store password/token for a saved server."""
+    if _KEYRING_AVAILABLE:
+        try:
+            keyring.set_password(_KEYRING_SERVICE, server_id, credential)
+            return
+        except Exception:
+            pass
+    # fallback: base64 in JSON
+    servers = _load_saved_servers()
+    for s in servers:
+        if s.get("id") == server_id:
+            s["_credential_b64"] = base64.b64encode(credential.encode()).decode()
+            break
+    _persist_saved_servers(servers)
+
+
+def _delete_credential(server_id: str) -> None:
+    """Remove stored credential for a saved server."""
+    if _KEYRING_AVAILABLE:
+        try:
+            keyring.delete_password(_KEYRING_SERVICE, server_id)
+        except Exception:
+            pass
+    else:
+        servers = _load_saved_servers()
+        for s in servers:
+            if s.get("id") == server_id:
+                s.pop("_credential_b64", None)
+                break
+        _persist_saved_servers(servers)
 
 
 @dataclass
@@ -806,7 +889,7 @@ def run_gui():
             QMessageBox, QCheckBox, QTextEdit, QHeaderView,
             QFrame, QListWidget, QListWidgetItem,
             QDialog, QDialogButtonBox, QAbstractItemView, QMenu,
-            QFileDialog
+            QFileDialog, QInputDialog, QSizePolicy
         )
         from PySide6.QtCore import (
             Qt, QThread, Signal, QSortFilterProxyModel, QModelIndex
@@ -1024,6 +1107,225 @@ def run_gui():
                     return
             super().mousePressEvent(event)
 
+    class EditSavedServerDialog(QDialog):
+        """Create or edit a saved VCD server entry."""
+
+        def __init__(self, parent=None, server_data: dict = None):
+            super().__init__(parent)
+            self._is_edit = server_data is not None
+            self._server_data = dict(server_data) if server_data else {}
+            self.setWindowTitle("Edit Saved Server" if self._is_edit else "Add Saved Server")
+            self.setMinimumWidth(420)
+
+            layout = QVBoxLayout(self)
+            form = QFormLayout()
+            form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+            self._name_input = QLineEdit(self._server_data.get("name", ""))
+            self._name_input.setPlaceholderText("e.g. Production VCD")
+            form.addRow("Display Name:", self._name_input)
+
+            self._server_input = QLineEdit(self._server_data.get("server", ""))
+            self._server_input.setPlaceholderText("e.g. vcd.example.com")
+            form.addRow("VCD Server:", self._server_input)
+
+            self._token_check = QCheckBox("Use API Token")
+            self._token_check.setChecked(self._server_data.get("auth_type") == "token")
+            self._token_check.stateChanged.connect(self._toggle_auth)
+            form.addRow("", self._token_check)
+
+            self._token_label = QLabel("API Token:")
+            self._token_input = QLineEdit()
+            self._token_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self._token_input.setPlaceholderText("Enter token (leave blank to keep existing)")
+            form.addRow(self._token_label, self._token_input)
+
+            self._username_label = QLabel("Username:")
+            self._username_input = QLineEdit(self._server_data.get("username", ""))
+            form.addRow(self._username_label, self._username_input)
+
+            self._password_label = QLabel("Password:")
+            self._password_input = QLineEdit()
+            self._password_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self._password_input.setPlaceholderText("Enter password (leave blank to keep existing)")
+            pwd_row = QHBoxLayout()
+            self._show_pwd = QCheckBox("Show")
+            self._show_pwd.stateChanged.connect(
+                lambda s: self._password_input.setEchoMode(
+                    QLineEdit.EchoMode.Normal if s else QLineEdit.EchoMode.Password
+                )
+            )
+            pwd_row.addWidget(self._password_input)
+            pwd_row.addWidget(self._show_pwd)
+            form.addRow(self._password_label, pwd_row)
+
+            self._tenant_input = QLineEdit(self._server_data.get("tenant", ""))
+            self._tenant_input.setPlaceholderText("Leave blank for system/provider")
+            form.addRow("Default Tenant:", self._tenant_input)
+
+            self._skip_ssl = QCheckBox("Skip SSL Verification")
+            self._skip_ssl.setChecked(self._server_data.get("skip_ssl_verify", True))
+            form.addRow("", self._skip_ssl)
+
+            if not _KEYRING_AVAILABLE:
+                warn = QLabel("Warning: keyring not installed — credentials stored as base64 in config file (not encrypted).")
+                warn.setStyleSheet("color: #ffb74d; font-size: 11px;")
+                warn.setWordWrap(True)
+                layout.addWidget(warn)
+
+            layout.addLayout(form)
+
+            btn_box = QDialogButtonBox(
+                QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+            )
+            btn_box.accepted.connect(self._on_save)
+            btn_box.rejected.connect(self.reject)
+            layout.addWidget(btn_box)
+
+            self._toggle_auth()
+
+        def _toggle_auth(self):
+            use_token = self._token_check.isChecked()
+            self._token_label.setVisible(use_token)
+            self._token_input.setVisible(use_token)
+            self._username_label.setVisible(not use_token)
+            self._username_input.setVisible(not use_token)
+            self._password_label.setVisible(not use_token)
+            self._password_input.setVisible(not use_token)
+            try:
+                self._show_pwd.setVisible(not use_token)
+            except Exception:
+                pass
+
+        def _on_save(self):
+            name = self._name_input.text().strip()
+            server = self._server_input.text().strip()
+            if not name or not server:
+                QMessageBox.warning(self, "Required", "Display Name and VCD Server are required.")
+                return
+            use_token = self._token_check.isChecked()
+            new_credential = (
+                self._token_input.text().strip()
+                if use_token
+                else self._password_input.text()
+            )
+            server_id = self._server_data.get("id") or str(uuid.uuid4())
+            entry = {
+                "id": server_id,
+                "name": name,
+                "server": server,
+                "auth_type": "token" if use_token else "password",
+                "username": "" if use_token else self._username_input.text().strip(),
+                "tenant": self._tenant_input.text().strip(),
+                "skip_ssl_verify": self._skip_ssl.isChecked(),
+            }
+            servers = _load_saved_servers()
+            existing_idx = next((i for i, s in enumerate(servers) if s.get("id") == server_id), -1)
+            if existing_idx >= 0:
+                servers[existing_idx] = entry
+            else:
+                servers.append(entry)
+            _persist_saved_servers(servers)
+            if new_credential:
+                _set_credential(server_id, new_credential)
+            self._saved_entry = entry
+            self.accept()
+
+        def get_saved_entry(self) -> dict:
+            return getattr(self, "_saved_entry", {})
+
+    class ManageSavedServersDialog(QDialog):
+        """List, add, edit, and delete saved VCD server entries."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setWindowTitle("Manage Saved VCD Servers")
+            self.setMinimumSize(500, 360)
+
+            layout = QVBoxLayout(self)
+
+            lbl = QLabel("Saved VCD Servers:")
+            layout.addWidget(lbl)
+
+            self._list = QListWidget()
+            self._list.setAlternatingRowColors(True)
+            self._list.currentRowChanged.connect(self._on_selection_changed)
+            layout.addWidget(self._list)
+
+            btn_row = QHBoxLayout()
+            self._add_btn = QPushButton("Add")
+            self._add_btn.clicked.connect(self._do_add)
+            self._edit_btn = QPushButton("Edit")
+            self._edit_btn.setEnabled(False)
+            self._edit_btn.clicked.connect(self._do_edit)
+            self._del_btn = QPushButton("Delete")
+            self._del_btn.setEnabled(False)
+            self._del_btn.setStyleSheet("color: #ef5350;")
+            self._del_btn.clicked.connect(self._do_delete)
+            btn_row.addWidget(self._add_btn)
+            btn_row.addWidget(self._edit_btn)
+            btn_row.addWidget(self._del_btn)
+            btn_row.addStretch()
+            layout.addLayout(btn_row)
+
+            close_row = QHBoxLayout()
+            close_row.addStretch()
+            close_btn = QPushButton("Close")
+            close_btn.clicked.connect(self.accept)
+            close_row.addWidget(close_btn)
+            layout.addLayout(close_row)
+
+            self._refresh_list()
+
+        def _refresh_list(self):
+            self._list.clear()
+            for s in _load_saved_servers():
+                auth = "Token" if s.get("auth_type") == "token" else f"Password ({s.get('username', '')})"
+                item = QListWidgetItem(f"{s['name']}  —  {s['server']}  [{auth}]")
+                item.setData(Qt.ItemDataRole.UserRole, s["id"])
+                self._list.addItem(item)
+
+        def _on_selection_changed(self, row):
+            has = row >= 0
+            self._edit_btn.setEnabled(has)
+            self._del_btn.setEnabled(has)
+
+        def _current_server(self):
+            item = self._list.currentItem()
+            if not item:
+                return None
+            sid = item.data(Qt.ItemDataRole.UserRole)
+            return next((s for s in _load_saved_servers() if s.get("id") == sid), None)
+
+        def _do_add(self):
+            dlg = EditSavedServerDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._refresh_list()
+
+        def _do_edit(self):
+            entry = self._current_server()
+            if not entry:
+                return
+            dlg = EditSavedServerDialog(self, server_data=entry)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                self._refresh_list()
+
+        def _do_delete(self):
+            entry = self._current_server()
+            if not entry:
+                return
+            reply = QMessageBox.question(
+                self,
+                "Delete Saved Server",
+                f"Delete '{entry['name']}'?\nThis cannot be undone.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                _delete_credential(entry["id"])
+                servers = [s for s in _load_saved_servers() if s.get("id") != entry["id"]]
+                _persist_saved_servers(servers)
+                self._refresh_list()
+
     class WorkerThread(QThread):
         """Background worker thread for long-running operations."""
         finished = Signal(object)
@@ -1046,8 +1348,10 @@ def run_gui():
     class VCDInstanceDialog(QDialog):
         """Dialog for connecting to an additional VCD instance and choosing its scan targets."""
 
-        def __init__(self, parent=None):
+        def __init__(self, parent=None, existing_client=None, existing_server=""):
             super().__init__(parent)
+            self._existing_client = existing_client
+            self._existing_server = existing_server
             self.setWindowTitle("Add VCD Instance")
             self.setMinimumWidth(520)
             self._client = None
@@ -1060,6 +1364,16 @@ def run_gui():
             # ---- Connection form ----
             conn_form = QFormLayout()
             conn_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+            # Saved servers row (hidden in existing_client mode)
+            self._dlg_saved_row_widget = QWidget()
+            saved_dlg_inner = QHBoxLayout(self._dlg_saved_row_widget)
+            saved_dlg_inner.setContentsMargins(0, 0, 0, 0)
+            self._dlg_saved_combo = QComboBox()
+            self._dlg_saved_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._dlg_saved_combo.currentIndexChanged.connect(self._on_dlg_saved_selected)
+            saved_dlg_inner.addWidget(self._dlg_saved_combo)
+            conn_form.addRow("Saved Server:", self._dlg_saved_row_widget)
 
             self._server_input = QLineEdit()
             self._server_input.setPlaceholderText("e.g. vcd.example.com")
@@ -1169,6 +1483,31 @@ def run_gui():
 
             main_layout.addLayout(sel_form)
 
+            # Populate saved combo for full connect mode
+            self._dlg_saved_combo.addItem("-- New Connection --", userData=None)
+            for s in _load_saved_servers():
+                label = f"{s['name']}  ({s['server']})"
+                self._dlg_saved_combo.addItem(label, userData=s["id"])
+
+            # If an existing connection is provided, hide the auth form and auto-load
+            if existing_client is not None:
+                self._dlg_saved_row_widget.setVisible(False)
+                self._connect_btn.setVisible(False)
+                self._server_input.setText(existing_server)
+                self._server_input.setReadOnly(True)
+                self._token_check.setVisible(False)
+                self._token_row_label.setVisible(False)
+                self._token_input.setVisible(False)
+                self._username_label.setVisible(False)
+                self._username_input.setVisible(False)
+                self._password_label.setVisible(False)
+                self._password_input.setVisible(False)
+                self._skip_ssl.setVisible(False)
+                self._status_label.setText(f"Connected: {existing_server}")
+                self._status_label.setStyleSheet("color: #66bb6a;")
+                self._client = existing_client
+                self._load_for_existing_client()
+
             # ---- Dialog buttons ----
             self._btn_box = QDialogButtonBox(
                 QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
@@ -1186,6 +1525,27 @@ def run_gui():
             self._username_input.setVisible(not use_token)
             self._password_label.setVisible(not use_token)
             self._password_input.setVisible(not use_token)
+
+        def _on_dlg_saved_selected(self, index):
+            if index <= 0:
+                return
+            server_id = self._dlg_saved_combo.itemData(index)
+            if not server_id:
+                return
+            entry = next((s for s in _load_saved_servers() if s.get("id") == server_id), None)
+            if not entry:
+                return
+            self._server_input.setText(entry.get("server", ""))
+            self._skip_ssl.setChecked(entry.get("skip_ssl_verify", True))
+            use_token = entry.get("auth_type") == "token"
+            self._token_check.setChecked(use_token)
+            self._on_auth_toggle()
+            cred = _get_credential(server_id)
+            if use_token:
+                self._token_input.setText(cred)
+            else:
+                self._username_input.setText(entry.get("username", ""))
+                self._password_input.setText(cred)
 
         def _do_connect(self):
             server = self._server_input.text().strip()
@@ -1373,6 +1733,24 @@ def run_gui():
                     w.wait()
             event.accept()
 
+        def _load_for_existing_client(self):
+            """Load orgs/catalogs/datastores using an already-authenticated client."""
+            self._progress.setVisible(True)
+
+            def fetch():
+                c = self._existing_client
+                return {
+                    "client": c,
+                    "orgs": c.get_organizations(),
+                    "catalogs": c.get_catalogs(),
+                    "datastores": c.get_datastores(),
+                }
+
+            self._connect_worker = WorkerThread(fetch)
+            self._connect_worker.finished.connect(self._on_connected)
+            self._connect_worker.error.connect(self._on_connect_error)
+            self._connect_worker.start()
+
     class MainWindow(QMainWindow):
         class ConnectionWorker(QThread):
             finished = Signal(bool, object)
@@ -1404,33 +1782,67 @@ def run_gui():
                     self.finished.emit(False, error_message)
 
         class DeleteWorker(QThread):
-            """Background worker that deletes shadow VMs with a delay between each."""
+            """Deletes shadow VMs, running each VCD instance's sequential loop in parallel."""
             progress = Signal(int, int, str)        # current, total, name
             item_done = Signal(object, bool, str)   # shadow, success, message
             finished = Signal(int, int)             # success_count, fail_count
 
-            def __init__(self, parent, client, shadows, delay_seconds=3):
+            def __init__(self, parent, sessions, shadows, delay_seconds=3):
                 super().__init__(parent)
-                self.client = client
+                self.sessions = sessions    # list of session dicts with 'client'/'server'
                 self.shadows = shadows
                 self.delay_seconds = delay_seconds
 
             def run(self):
-                success_count = 0
-                fail_count = 0
-                total = len(self.shadows)
-                for i, shadow in enumerate(self.shadows):
-                    self.progress.emit(i + 1, total, shadow.name)
-                    success, message = self.client.delete_shadow_vm(shadow)
-                    self.item_done.emit(shadow, success, message)
-                    if success:
-                        success_count += 1
-                    else:
-                        fail_count += 1
-                    # Rate-limit between deletes (skip after the last one)
-                    if i < total - 1:
-                        self.msleep(int(self.delay_seconds * 1000))
-                self.finished.emit(success_count, fail_count)
+                import time as _time
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from collections import defaultdict
+
+                # Map server → client
+                server_to_client = {s["server"]: s["client"] for s in self.sessions}
+
+                # Group shadows by vcd_server so each VCD runs its own sequential loop
+                groups = defaultdict(list)
+                for shadow in self.shadows:
+                    groups[shadow.vcd_server].append(shadow)
+
+                def delete_group(server, group_shadows):
+                    client = server_to_client.get(server)
+                    local_success = 0
+                    local_fail = 0
+                    for i, shadow in enumerate(group_shadows):
+                        self.progress.emit(
+                            i + 1, len(group_shadows), f"[{server}] {shadow.name}"
+                        )
+                        if client is None:
+                            self.item_done.emit(
+                                shadow, False, f"No client for server '{server}'"
+                            )
+                            local_fail += 1
+                        else:
+                            ok, msg = client.delete_shadow_vm(shadow)
+                            self.item_done.emit(shadow, ok, msg)
+                            if ok:
+                                local_success += 1
+                            else:
+                                local_fail += 1
+                        if i < len(group_shadows) - 1:
+                            _time.sleep(self.delay_seconds)
+                    return local_success, local_fail
+
+                total_success = 0
+                total_fail = 0
+                with ThreadPoolExecutor(max_workers=max(1, len(groups))) as executor:
+                    futs = [
+                        executor.submit(delete_group, srv, shds)
+                        for srv, shds in groups.items()
+                    ]
+                    for fut in as_completed(futs):
+                        s, f = fut.result()
+                        total_success += s
+                        total_fail += f
+
+                self.finished.emit(total_success, total_fail)
 
         def __init__(self):
             super().__init__()
@@ -1441,10 +1853,11 @@ def run_gui():
             self._active_filters: dict[int, set[str]] = {}
             self._sort_col = -1
             self._sort_asc = True
-            self.extra_sessions: list = []  # additional VCD instances for multi-VCD scans
+            self.vcd_sessions: list = []  # additional VCD instances for multi-VCD scans
 
             self.init_ui()
             self.reset_connection_ui()
+            self._populate_saved_combo()
 
         def init_ui(self):
             self.setWindowTitle("VMware Cloud Director Shadow VM Cleanup")
@@ -1462,6 +1875,19 @@ def run_gui():
             conn_group = QGroupBox("VCD Connection")
             conn_layout = QFormLayout()
             conn_layout.setSpacing(8)
+
+            # --- Saved Servers row ---
+            saved_row = QHBoxLayout()
+            self._saved_combo = QComboBox()
+            self._saved_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            self._saved_combo.currentIndexChanged.connect(self._on_saved_server_selected)
+            saved_row.addWidget(self._saved_combo)
+            manage_btn = QPushButton("Manage...")
+            manage_btn.setMaximumHeight(26)
+            manage_btn.setStyleSheet("font-size: 11px; padding: 2px 8px;")
+            manage_btn.clicked.connect(self._open_manage_saved_servers)
+            saved_row.addWidget(manage_btn)
+            conn_layout.addRow("Saved Server:", saved_row)
 
             self.server_input = QLineEdit()
             self.server_input.setPlaceholderText("e.g., vcd.example.com")
@@ -1510,76 +1936,49 @@ def run_gui():
             self.disconnect_btn.clicked.connect(self.disconnect_from_vcd)
             self.disconnect_btn.setMinimumHeight(35)
             self.disconnect_btn.setEnabled(False)
+            self._save_conn_btn = QPushButton("Save Connection")
+            self._save_conn_btn.setMinimumHeight(35)
+            self._save_conn_btn.setEnabled(False)
+            self._save_conn_btn.setToolTip("Save these connection details for future use")
+            self._save_conn_btn.clicked.connect(self._save_current_connection)
             btn_layout_conn = QHBoxLayout()
             btn_layout_conn.addWidget(self.connect_btn)
             btn_layout_conn.addWidget(self.disconnect_btn)
+            btn_layout_conn.addWidget(self._save_conn_btn)
             conn_layout.addRow("", btn_layout_conn)
 
             conn_group.setLayout(conn_layout)
             main_layout.addWidget(conn_group)
 
-            # --- Selection Group ---
-            select_group = QGroupBox("Selection")
-            select_layout = QFormLayout()
-            select_layout.setSpacing(8)
+            # --- VCD Instances panel ---
+            instances_frame = QFrame()
+            instances_frame.setFrameShape(QFrame.Shape.StyledPanel)
+            instances_outer = QVBoxLayout(instances_frame)
+            instances_outer.setContentsMargins(8, 6, 8, 8)
+            instances_outer.setSpacing(6)
 
-            self.tenant_combo = QComboBox()
-            self.tenant_combo.setEnabled(False)
-            self.tenant_combo.currentTextChanged.connect(self.on_tenant_changed)
-            select_layout.addRow("Tenant:", self.tenant_combo)
+            # Header row: "VCD Instances" title + "+ Add VCD Instance" button
+            instances_header = QHBoxLayout()
+            instances_title = QLabel("VCD Instances")
+            instances_title.setStyleSheet("font-weight: bold; font-size: 13px;")
+            instances_header.addWidget(instances_title)
+            instances_header.addStretch()
+            add_instance_btn = QPushButton("+ Add VCD Instance")
+            add_instance_btn.setMaximumHeight(26)
+            add_instance_btn.setStyleSheet("font-size: 11px; padding: 2px 10px;")
+            add_instance_btn.clicked.connect(self._add_vcd_instance)
+            instances_header.addWidget(add_instance_btn)
+            instances_outer.addLayout(instances_header)
 
-            catalog_container = QVBoxLayout()
-            catalog_btn_row = QHBoxLayout()
-            catalog_btn_row.setSpacing(4)
-            self.catalog_select_all_btn = QPushButton("Select All")
-            self.catalog_select_all_btn.setMaximumHeight(22)
-            self.catalog_select_all_btn.setEnabled(False)
-            self.catalog_select_all_btn.clicked.connect(self._catalog_select_all)
-            self.catalog_deselect_all_btn = QPushButton("Deselect All")
-            self.catalog_deselect_all_btn.setMaximumHeight(22)
-            self.catalog_deselect_all_btn.setEnabled(False)
-            self.catalog_deselect_all_btn.clicked.connect(self._catalog_deselect_all)
-            catalog_btn_row.addWidget(self.catalog_select_all_btn)
-            catalog_btn_row.addWidget(self.catalog_deselect_all_btn)
-            catalog_btn_row.addStretch()
-            catalog_container.addLayout(catalog_btn_row)
+            self._sessions_list_container = QWidget()
+            self._sessions_list_layout = QVBoxLayout(self._sessions_list_container)
+            self._sessions_list_layout.setContentsMargins(0, 0, 0, 0)
+            self._sessions_list_layout.setSpacing(2)
+            instances_outer.addWidget(self._sessions_list_container)
 
-            self.catalog_list = QListWidget()
-            self.catalog_list.setEnabled(False)
-            self.catalog_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-            self.catalog_list.setMaximumHeight(120)
-            catalog_container.addWidget(self.catalog_list)
+            main_layout.addWidget(instances_frame)
 
-            catalog_widget = QWidget()
-            catalog_widget.setLayout(catalog_container)
-            select_layout.addRow("Catalog(s):", catalog_widget)
-
-            datastore_container = QVBoxLayout()
-            datastore_btn_row = QHBoxLayout()
-            datastore_btn_row.setSpacing(4)
-            self.datastore_select_all_btn = QPushButton("Select All")
-            self.datastore_select_all_btn.setMaximumHeight(22)
-            self.datastore_select_all_btn.setEnabled(False)
-            self.datastore_select_all_btn.clicked.connect(self._datastore_select_all)
-            self.datastore_deselect_all_btn = QPushButton("Deselect All")
-            self.datastore_deselect_all_btn.setMaximumHeight(22)
-            self.datastore_deselect_all_btn.setEnabled(False)
-            self.datastore_deselect_all_btn.clicked.connect(self._datastore_deselect_all)
-            datastore_btn_row.addWidget(self.datastore_select_all_btn)
-            datastore_btn_row.addWidget(self.datastore_deselect_all_btn)
-            datastore_btn_row.addStretch()
-            datastore_container.addLayout(datastore_btn_row)
-
-            self.datastore_list = QListWidget()
-            self.datastore_list.setEnabled(False)
-            self.datastore_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
-            self.datastore_list.setMaximumHeight(120)
-            datastore_container.addWidget(self.datastore_list)
-
-            datastore_widget = QWidget()
-            datastore_widget.setLayout(datastore_container)
-            select_layout.addRow("Datastore(s):", datastore_widget)
-
+            # --- Scan / Cleanup buttons ---
             btn_layout = QHBoxLayout()
             self.scan_btn = QPushButton("Scan for Shadow VMs")
             self.scan_btn.clicked.connect(self.scan_shadow_vms)
@@ -1593,33 +1992,7 @@ def run_gui():
             self.cleanup_btn.setMinimumHeight(35)
             self.cleanup_btn.setStyleSheet("background-color: #d32f2f; color: white;")
             btn_layout.addWidget(self.cleanup_btn)
-
-            select_layout.addRow("", btn_layout)
-            select_group.setLayout(select_layout)
-            main_layout.addWidget(select_group)
-
-            # --- Additional VCD Instances panel ---
-            instances_group = QGroupBox("Additional VCD Instances")
-            instances_layout = QVBoxLayout()
-            instances_layout.setSpacing(4)
-
-            self._sessions_list_container = QWidget()
-            self._sessions_list_layout = QVBoxLayout(self._sessions_list_container)
-            self._sessions_list_layout.setContentsMargins(0, 0, 0, 0)
-            self._sessions_list_layout.setSpacing(2)
-            instances_layout.addWidget(self._sessions_list_container)
-
-            add_instance_row = QHBoxLayout()
-            add_instance_row.addStretch()
-            add_instance_btn = QPushButton("+ Add VCD Instance")
-            add_instance_btn.setMaximumHeight(26)
-            add_instance_btn.setStyleSheet("font-size: 11px; padding: 2px 10px;")
-            add_instance_btn.clicked.connect(self._add_vcd_instance)
-            add_instance_row.addWidget(add_instance_btn)
-            instances_layout.addLayout(add_instance_row)
-
-            instances_group.setLayout(instances_layout)
-            main_layout.addWidget(instances_group)
+            main_layout.addLayout(btn_layout)
 
             # --- Results Group ---
             results_group = QGroupBox("Shadow VMs Found")
@@ -1884,6 +2257,9 @@ def run_gui():
                 if item and item.text() in expanded:
                     tree.expand(model.index(r, 0))
 
+            # Re-apply filters so hidden state matches the new row order
+            self._apply_filters()
+
         def _export_csv(self, include_shadows: bool):
             """Export the currently visible results to a CSV file.
 
@@ -2102,6 +2478,93 @@ def run_gui():
             else:
                 self.summary_label.setText(f"Showing {visible_vms} of {total_vms} Shadow VMs (filtered)")
 
+        # ---- saved servers ----
+
+        def _populate_saved_combo(self):
+            self._saved_combo.blockSignals(True)
+            self._saved_combo.clear()
+            self._saved_combo.addItem("-- New Connection --", userData=None)
+            for s in _load_saved_servers():
+                label = f"{s['name']}  ({s['server']})"
+                self._saved_combo.addItem(label, userData=s["id"])
+            self._saved_combo.blockSignals(False)
+
+        def _on_saved_server_selected(self, index):
+            if index <= 0:
+                return
+            server_id = self._saved_combo.itemData(index)
+            if not server_id:
+                return
+            entry = next((s for s in _load_saved_servers() if s.get("id") == server_id), None)
+            if not entry:
+                return
+            self.server_input.setText(entry.get("server", ""))
+            self.skip_ssl_check.setChecked(entry.get("skip_ssl_verify", True))
+            use_token = entry.get("auth_type") == "token"
+            self.auth_token_radio.setChecked(use_token)
+            self.toggle_auth_mode(
+                Qt.CheckState.Checked.value if use_token else Qt.CheckState.Unchecked.value
+            )
+            cred = _get_credential(server_id)
+            if use_token:
+                self.token_input.setText(cred)
+            else:
+                self.username_input.setText(entry.get("username", ""))
+                self.password_input.setText(cred)
+
+        def _open_manage_saved_servers(self):
+            dlg = ManageSavedServersDialog(self)
+            dlg.exec()
+            self._populate_saved_combo()
+
+        def _save_current_connection(self):
+            server = self.server_input.text().strip()
+            if not server:
+                return
+            use_token = self.auth_token_radio.isChecked()
+            credential = self.token_input.text().strip() if use_token else self.password_input.text()
+            username = "" if use_token else self.username_input.text().strip()
+
+            servers = _load_saved_servers()
+            existing = next(
+                (s for s in servers
+                 if s.get("server") == server
+                 and s.get("auth_type") == ("token" if use_token else "password")
+                 and s.get("username", "") == username),
+                None
+            )
+
+            if existing:
+                if credential:
+                    _set_credential(existing["id"], credential)
+                self.log(f"Saved server '{existing['name']}' updated.")
+                self.statusBar().showMessage(f"Saved: {existing['name']}")
+            else:
+                name, ok = QInputDialog.getText(
+                    self,
+                    "Save Connection",
+                    "Enter a display name for this server:",
+                    text=server,
+                )
+                if not ok or not name.strip():
+                    return
+                entry = {
+                    "id": str(uuid.uuid4()),
+                    "name": name.strip(),
+                    "server": server,
+                    "auth_type": "token" if use_token else "password",
+                    "username": username,
+                    "tenant": "",
+                    "skip_ssl_verify": self.skip_ssl_check.isChecked(),
+                }
+                servers.append(entry)
+                _persist_saved_servers(servers)
+                if credential:
+                    _set_credential(entry["id"], credential)
+                self.log(f"Connection saved as '{name.strip()}'.")
+                self.statusBar().showMessage(f"Saved: {name.strip()}")
+            self._populate_saved_combo()
+
         # ---- auth toggles ----
 
         def toggle_auth_mode(self, state):
@@ -2170,7 +2633,8 @@ def run_gui():
                 self.connect_btn.setStyleSheet("background-color: green;")
                 self.connect_btn.setEnabled(False)
                 self.disconnect_btn.setEnabled(True)
-                self.load_dropdowns()
+                self._save_conn_btn.setEnabled(True)
+                self._configure_primary_instance()
             else:
                 error_message = result_or_error
                 self.log(f"Connection failed: {error_message}")
@@ -2193,28 +2657,19 @@ def run_gui():
             self.disconnect_btn.setEnabled(False)
             self.progress_bar.setVisible(False)
 
-            self.tenant_combo.clear()
-            self.tenant_combo.setEnabled(False)
-            self.catalog_list.clear()
-            self.catalog_list.setEnabled(False)
-            self.catalog_select_all_btn.setEnabled(False)
-            self.catalog_deselect_all_btn.setEnabled(False)
-            self.datastore_list.clear()
-            self.datastore_list.setEnabled(False)
-            self.datastore_select_all_btn.setEnabled(False)
-            self.datastore_deselect_all_btn.setEnabled(False)
-
             self.scan_btn.setEnabled(False)
             self.cleanup_btn.setEnabled(False)
+            if hasattr(self, "_save_conn_btn"):
+                self._save_conn_btn.setEnabled(False)
 
-            # Disconnect and clear any extra VCD sessions
-            for session in self.extra_sessions:
+            # Disconnect and clear any VCD sessions
+            for session in self.vcd_sessions:
                 try:
                     session["client"].disconnect()
                 except Exception:
                     pass
-            self.extra_sessions.clear()
-            self._refresh_extra_sessions_ui()
+            self.vcd_sessions.clear()
+            self._refresh_sessions_ui()
 
             self._tree_model.removeRows(0, self._tree_model.rowCount())
             self._active_filters.clear()
@@ -2226,184 +2681,49 @@ def run_gui():
             self.results_table.header().set_check_state(Qt.CheckState.Unchecked)
             self.summary_label.setText("No scan performed yet.")
 
-        # ---- dropdowns ----
-
-        def load_dropdowns(self):
-            if not self.client:
-                return
-
-            self.log("Loading organizations, catalogs, and datastores...")
-            self.statusBar().showMessage("Loading...")
-            self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)
-            self.scan_btn.setEnabled(False)
-
-            def fetch(client):
-                return {
-                    "orgs": client.get_organizations(),
-                    "catalogs": client.get_catalogs(),
-                    "datastores": client.get_datastores(),
-                }
-
-            self.dropdown_worker = WorkerThread(fetch, self.client)
-            self.dropdown_worker.finished.connect(self._on_dropdowns_loaded)
-            self.dropdown_worker.error.connect(self._on_dropdowns_error)
-            self.dropdown_worker.start()
-
-        def _on_dropdowns_loaded(self, data):
-            self.progress_bar.setVisible(False)
-
-            orgs = data["orgs"]
-            self.tenant_combo.blockSignals(True)
-            self.tenant_combo.clear()
-            self.tenant_combo.addItem("-- Select Tenant --")
-            for org in orgs:
-                self.tenant_combo.addItem(org["name"])
-            self.tenant_combo.setEnabled(True)
-            self.tenant_combo.blockSignals(False)
-            self.log(f"Loaded {len(orgs)} organizations")
-
-            self._populate_catalog_list(data["catalogs"])
-            self.log(f"Loaded {len(data['catalogs'])} catalogs")
-
-            self._populate_datastore_list(data["datastores"])
-            self.log(f"Loaded {len(data['datastores'])} datastores")
-
-            self.scan_btn.setEnabled(True)
-            self.statusBar().showMessage("Ready to scan.")
-            self.log("Ready to scan.")
-
-        def _on_dropdowns_error(self, error_message: str):
-            self.progress_bar.setVisible(False)
-            self.log(f"Failed to load selections: {error_message}")
-            self.statusBar().showMessage("Failed to load selections")
-            QMessageBox.critical(
-                self, "Error", f"Failed to load tenants/catalogs/datastores:\n{error_message}"
+        def _configure_primary_instance(self):
+            """Auto-open the configure dialog for the just-connected primary VCD."""
+            server = self.server_input.text().strip()
+            self.log(f"Connected to {server}. Configure scan targets...")
+            dlg = VCDInstanceDialog(
+                self, existing_client=self.client, existing_server=server
             )
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                session = dlg.get_session()
+                if session:
+                    self.vcd_sessions.append(session)
+                    self._refresh_sessions_ui()
+                    self.scan_btn.setEnabled(True)
+                    self.log(
+                        f"Configured: {session['server']} / {session['org']} — "
+                        f"{len(session['catalogs'])} catalog(s), "
+                        f"{len(session['datastores'])} datastore(s)"
+                    )
+                    self.statusBar().showMessage("Ready to scan.")
+            else:
+                self.log("Configuration cancelled. Click '+ Add VCD Instance' when ready.")
+                self.statusBar().showMessage("Connected — configure a VCD instance to scan.")
 
-        def on_tenant_changed(self, tenant_name: str):
-            if self.client and tenant_name and not tenant_name.startswith("--"):
-                self.client.switch_to_org(tenant_name)
-                self.log(f"Switched to tenant: {tenant_name}")
-                self.log(f"Loading catalogs for tenant '{tenant_name}'...")
-                self.statusBar().showMessage(f"Loading catalogs for {tenant_name}...")
-                self.catalog_list.setEnabled(False)
-                self.catalog_select_all_btn.setEnabled(False)
-                self.catalog_deselect_all_btn.setEnabled(False)
-                self.scan_btn.setEnabled(False)
-                self.progress_bar.setVisible(True)
-                self.progress_bar.setRange(0, 0)
-
-                self.catalog_worker = WorkerThread(
-                    self.client.get_catalogs, org_name=tenant_name
-                )
-                self.catalog_worker.finished.connect(
-                    lambda catalogs, t=tenant_name: self._on_tenant_catalogs_loaded(catalogs, t)
-                )
-                self.catalog_worker.error.connect(self._on_tenant_catalogs_error)
-                self.catalog_worker.start()
-
-        def _on_tenant_catalogs_loaded(self, catalogs, tenant_name: str):
-            self.progress_bar.setVisible(False)
-            self._populate_catalog_list(catalogs)
-            self.log(f"Loaded {len(catalogs)} catalogs for tenant '{tenant_name}'")
-            self.statusBar().showMessage("Ready")
-            self.scan_btn.setEnabled(True)
-
-        def _on_tenant_catalogs_error(self, error_message: str):
-            self.progress_bar.setVisible(False)
-            self.scan_btn.setEnabled(True)
-            self.log(f"Failed to load catalogs: {error_message}")
-            self.statusBar().showMessage("Failed to load catalogs")
-            QMessageBox.critical(
-                self, "Error", f"Failed to load catalogs for tenant:\n{error_message}"
-            )
-
-        def _populate_catalog_list(self, catalogs: list):
-            self.catalog_list.clear()
-            for catalog in catalogs:
-                flags = []
-                if catalog.get('isShared'):
-                    flags.append("Shared")
-                if catalog.get('isPublished'):
-                    flags.append("Published")
-                flag_str = f" [{', '.join(flags)}]" if flags else ""
-                display_name = f"{catalog['name']} ({catalog.get('orgName', 'N/A')}){flag_str}"
-                item = QListWidgetItem(display_name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, catalog['name'])
-                self.catalog_list.addItem(item)
-            self.catalog_list.setEnabled(True)
-            self.catalog_select_all_btn.setEnabled(True)
-            self.catalog_deselect_all_btn.setEnabled(True)
-
-        def _catalog_select_all(self):
-            for i in range(self.catalog_list.count()):
-                self.catalog_list.item(i).setCheckState(Qt.CheckState.Checked)
-
-        def _catalog_deselect_all(self):
-            for i in range(self.catalog_list.count()):
-                self.catalog_list.item(i).setCheckState(Qt.CheckState.Unchecked)
-
-        def _get_selected_catalog_names(self) -> list:
-            selected = []
-            for i in range(self.catalog_list.count()):
-                item = self.catalog_list.item(i)
-                if item.checkState() == Qt.CheckState.Checked:
-                    selected.append(item.data(Qt.ItemDataRole.UserRole))
-            return selected
-
-        def _populate_datastore_list(self, datastores: list):
-            self.datastore_list.clear()
-            for ds in datastores:
-                vc_name = ds.get('vcName', '')
-                display_name = f"{ds['name']} ({vc_name})" if vc_name else ds['name']
-                item = QListWidgetItem(display_name)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
-                item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, ds['name'])
-                self.datastore_list.addItem(item)
-            self.datastore_list.setEnabled(True)
-            self.datastore_select_all_btn.setEnabled(True)
-            self.datastore_deselect_all_btn.setEnabled(True)
-
-        def _datastore_select_all(self):
-            for i in range(self.datastore_list.count()):
-                self.datastore_list.item(i).setCheckState(Qt.CheckState.Checked)
-
-        def _datastore_deselect_all(self):
-            for i in range(self.datastore_list.count()):
-                self.datastore_list.item(i).setCheckState(Qt.CheckState.Unchecked)
-
-        def _get_selected_datastore_names(self) -> list:
-            selected = []
-            for i in range(self.datastore_list.count()):
-                item = self.datastore_list.item(i)
-                if item.checkState() == Qt.CheckState.Checked:
-                    selected.append(item.data(Qt.ItemDataRole.UserRole))
-            return selected
-
-        # ---- extra VCD sessions ----
+        # ---- VCD sessions ----
 
         def _add_vcd_instance(self):
             dlg = VCDInstanceDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 session = dlg.get_session()
                 if session:
-                    self.extra_sessions.append(session)
-                    self._refresh_extra_sessions_ui()
+                    self.vcd_sessions.append(session)
+                    self._refresh_sessions_ui()
 
         def _remove_extra_session(self, idx: int):
-            if 0 <= idx < len(self.extra_sessions):
+            if 0 <= idx < len(self.vcd_sessions):
                 try:
-                    self.extra_sessions[idx]["client"].disconnect()
+                    self.vcd_sessions[idx]["client"].disconnect()
                 except Exception:
                     pass
-                del self.extra_sessions[idx]
-                self._refresh_extra_sessions_ui()
+                del self.vcd_sessions[idx]
+                self._refresh_sessions_ui()
 
-        def _refresh_extra_sessions_ui(self):
+        def _refresh_sessions_ui(self):
             layout = self._sessions_list_layout
             while layout.count():
                 item = layout.takeAt(0)
@@ -2411,12 +2731,12 @@ def run_gui():
                 if w:
                     w.deleteLater()
 
-            if not self.extra_sessions:
+            if not self.vcd_sessions:
                 lbl = QLabel("No additional VCD instances configured.")
                 lbl.setStyleSheet("color: #888; font-style: italic; font-size: 11px;")
                 layout.addWidget(lbl)
             else:
-                for i, session in enumerate(self.extra_sessions):
+                for i, session in enumerate(self.vcd_sessions):
                     cats = len(session["catalogs"])
                     dss = len(session["datastores"])
                     row_widget = QWidget()
@@ -2446,37 +2766,20 @@ def run_gui():
             if not self.client:
                 return
 
-            selected_catalogs = self._get_selected_catalog_names()
-            if not selected_catalogs:
-                QMessageBox.warning(self, "Error", "Please select at least one catalog.")
+            if not self.vcd_sessions:
+                QMessageBox.warning(
+                    self, "Error",
+                    "No VCD instances configured.\nClick '+ Add VCD Instance' to configure one."
+                )
                 return
 
-            selected_datastores = self._get_selected_datastore_names()
-            if not selected_datastores:
-                QMessageBox.warning(self, "Error", "Please select at least one datastore.")
-                return
-
-            primary_server = self.server_input.text().strip()
-            primary_org = self.tenant_combo.currentText()
-            if primary_org.startswith("--"):
-                primary_org = "system"
-
-            all_sessions = [
-                {
-                    "client": self.client,
-                    "server": primary_server,
-                    "org": primary_org,
-                    "catalogs": selected_catalogs,
-                    "datastores": selected_datastores,
-                }
-            ] + self.extra_sessions
-
+            all_sessions = list(self.vcd_sessions)
             total_vcds = len(all_sessions)
             total_cats = sum(len(s["catalogs"]) for s in all_sessions)
             total_ds = sum(len(s["datastores"]) for s in all_sessions)
             self.log(
-                f"Scanning {total_vcds} VCD instance(s), {total_cats} catalog(s), "
-                f"{total_ds} datastore(s)..."
+                f"Scanning {total_vcds} VCD instance(s) in parallel — "
+                f"{total_cats} catalog(s), {total_ds} datastore(s)..."
             )
             self.statusBar().showMessage("Scanning...")
             self.scan_btn.setEnabled(False)
@@ -2484,10 +2787,11 @@ def run_gui():
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
 
-            def run_multi_scan():
-                all_shadows = []
-                for session in all_sessions:
-                    results = scan_shadow_vms(
+            def run_parallel_scan():
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                def scan_one(session):
+                    return scan_shadow_vms(
                         session["client"],
                         session["catalogs"],
                         session["datastores"],
@@ -2495,11 +2799,15 @@ def run_gui():
                         org_name=session["org"],
                         debug=False,
                     )
-                    all_shadows.extend(results)
+
+                all_shadows = []
+                with ThreadPoolExecutor(max_workers=max(1, len(all_sessions))) as executor:
+                    futures = [executor.submit(scan_one, s) for s in all_sessions]
+                    for future in as_completed(futures):
+                        all_shadows.extend(future.result())
                 return all_shadows
 
-            # Run on a background thread so the UI stays responsive.
-            self.scan_worker = WorkerThread(run_multi_scan)
+            self.scan_worker = WorkerThread(run_parallel_scan)
             self.scan_worker.finished.connect(self._on_scan_finished)
             self.scan_worker.error.connect(self._on_scan_error)
             self.scan_worker.start()
@@ -2684,7 +2992,9 @@ def run_gui():
             # Run deletion on a background thread (it sleeps between deletes) so the
             # UI stays responsive instead of showing the macOS spinning beachball.
             self._deleted_shadow_ids = set()
-            self.delete_worker = self.DeleteWorker(self, self.client, selected_shadow_vms)
+            self.delete_worker = self.DeleteWorker(
+                self, list(self.vcd_sessions), selected_shadow_vms
+            )
             self.delete_worker.progress.connect(self._on_delete_progress)
             self.delete_worker.item_done.connect(self._on_delete_item_done)
             self.delete_worker.finished.connect(self._on_delete_finished)
@@ -2751,7 +3061,7 @@ def run_gui():
                     worker.wait()
             if self.client and self.client.access_token:
                 self.client.disconnect()
-            for session in self.extra_sessions:
+            for session in self.vcd_sessions:
                 try:
                     session["client"].disconnect()
                 except Exception:
