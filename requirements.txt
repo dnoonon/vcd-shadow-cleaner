@@ -10,5 +10,8 @@ requests>=2.28.0
 # Optional: for better SSL handling
 urllib3>=2.0.0
 
+# Secure credential storage (OS keychain: macOS Keychain, Windows Credential Manager, Linux Secret Service)
+keyring>=24.0.0
+
 # Optional: for creating binaries
 PyInstaller>=5.0.0
