@@ -922,7 +922,7 @@ def run_gui():
             super().__init__(parent)
             self._filters: dict[int, set[str]] = {}
 
-        def set_column_filter(self, col: int, allowed: set[str] | None):
+        def set_column_filter(self, col: int, allowed: Optional[set[str]]):
             if allowed is None:
                 self._filters.pop(col, None)
             else:
@@ -948,11 +948,11 @@ def run_gui():
     class FilterPopupDialog(QDialog):
         """Excel-style multi-select filter popup for a column."""
 
-        def __init__(self, parent, title: str, all_values: list[str], checked_values: set[str] | None):
+        def __init__(self, parent, title: str, all_values: list[str], checked_values: Optional[set[str]]):
             super().__init__(parent)
             self.setWindowTitle(f"Filter: {title}")
             self.setMinimumSize(280, 350)
-            self.result_set: set[str] | None = None
+            self.result_set: Optional[set[str]] = None
 
             layout = QVBoxLayout(self)
 
