@@ -13,13 +13,19 @@ Requirements:
     - requests
 
 Usage:
-    GUI Mode:   python vcd_shadow_cleaner.py 
-    CLI Mode:   python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> 
+    GUI Mode:   python vcd_shadow_cleaner.py
+    CLI Mode:   python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token>
                     --tenant <tenant_name> --catalog <catalog_name> --datastore <datastore_name>
-                    [--dry-run]
+                    [--dry-run] [--json]
+                python vcd_shadow_cleaner.py --cli --saved-server <name> \
+                    --catalog <catalog_name> --datastore <datastore_name>
+                python vcd_shadow_cleaner.py --cli --list-servers
+                python vcd_shadow_cleaner.py --cli --saved-server <name> \
+                    [--list-tenants] [--list-catalogs] [--list-datastores]
 """
 
 import argparse
+import contextlib
 import sys
 import json
 import urllib3
@@ -148,6 +154,22 @@ def _delete_credential(server_id: str) -> None:
                 s.pop("_credential_b64", None)
                 break
         _persist_saved_servers(servers)
+
+
+def _find_saved_server(name_or_id: str) -> Optional[dict]:
+    """Look up a saved server profile by id, display name, or hostname."""
+    servers = _load_saved_servers()
+    for s in servers:
+        if s.get("id") == name_or_id:
+            return s
+    needle = name_or_id.strip().lower()
+    for s in servers:
+        if s.get("name", "").strip().lower() == needle:
+            return s
+    for s in servers:
+        if s.get("server", "").strip().lower() == needle:
+            return s
+    return None
 
 
 @dataclass
@@ -801,82 +823,218 @@ def print_shadow_vm_table(shadows: List[ShadowVM]):
 
 def run_cli(args):
     """Run in CLI mode."""
-    print("=" * 60)
-    print("VMware Cloud Director Shadow VM Cleanup Tool")
-    print("=" * 60)
-    
-    if args.dry_run:
-        print("\n*** DRY RUN MODE - No changes will be made ***\n")
-    
-    # Initialize client
-    client = VCDClient(args.server, verify_ssl=not args.skip_ssl_verify)
-    
-    # Authenticate
-    print(f"\nConnecting to {args.server}...")
-    if args.token:
-        if not client.authenticate_with_token(args.token, "system"):
-            print("ERROR: Authentication failed")
-            return 1
-    elif args.username and args.password:
-        if not client.authenticate_with_credentials(args.username, args.password, "system"):
-            print("ERROR: Authentication failed")
-            return 1
-    else:
-        print("ERROR: Either --token or --username/--password must be provided")
-        return 1
-    
-    print("Connected successfully!")
-    
-    # Switch to tenant if specified
-    if args.tenant and args.tenant.lower() != "system":
-        print(f"Switching to tenant: {args.tenant}")
-        client.switch_to_org(args.tenant)
-    
-    # Scan for Shadow VMs (support comma-separated catalog and datastore names from CLI)
-    catalog_names = [c.strip() for c in args.catalog.split(",")]
-    datastore_names = [d.strip() for d in args.datastore.split(",")]
-    shadows = scan_shadow_vms(client, catalog_names, datastore_names)
-    
-    # Print results
-    print_shadow_vm_table(shadows)
-    
-    if not shadows:
-        client.disconnect()
-        return 0
-    
-    if args.dry_run:
-        print("\n*** DRY RUN COMPLETE - No Shadow VMs were deleted ***")
-        client.disconnect()
-        return 0
-    
-    # Prompt for confirmation
-    print(f"\nAre you sure you want to delete {len(shadows)} Shadow VMs?")
-    response = input("Type 'yes' to confirm: ").strip().lower()
-    
-    if response != 'yes':
-        print("Operation cancelled.")
-        client.disconnect()
-        return 0
-    
-    # Delete Shadow VMs
-    print("\nDeleting Shadow VMs...")
-    success_count = 0
-    fail_count = 0
-    
-    for i, shadow in enumerate(shadows, 1):
-        print(f"  [{i}/{len(shadows)}] Deleting {shadow.name}...", end=" ")
-        success, message = client.delete_shadow_vm(shadow)
-        if success:
-            print("OK")
-            success_count += 1
+    as_json = args.json
+    # In JSON mode all progress/informational output goes to stderr so stdout
+    # stays pure machine-readable JSON.
+    info = sys.stderr if as_json else sys.stdout
+
+    def emit_json(payload):
+        print(json.dumps(payload, indent=2))
+
+    # --list-servers needs no connection at all.
+    if args.list_servers:
+        servers = _load_saved_servers()
+        if as_json:
+            emit_json({"saved_servers": [
+                {
+                    "name": s.get("name", ""),
+                    "server": s.get("server", ""),
+                    "auth_type": s.get("auth_type", ""),
+                    "username": s.get("username", ""),
+                    "default_org": s.get("org", ""),
+                    "skip_ssl_verify": s.get("skip_ssl_verify", True),
+                }
+                for s in servers
+            ]})
+        elif not servers:
+            print("No saved servers found. Add one in the GUI (Manage Saved Servers).")
         else:
-            print(f"FAILED - {message}")
-            fail_count += 1
-    
-    print(f"\nDeletion complete: {success_count} succeeded, {fail_count} failed")
-    
-    client.disconnect()
-    return 0 if fail_count == 0 else 1
+            print(f"Saved servers ({_SERVERS_FILE}):")
+            for s in servers:
+                auth = "token" if s.get("auth_type") == "token" else f"password ({s.get('username', '')})"
+                org = s.get("org") or "system"
+                print(f"  {s.get('name', '?'):<30} {s.get('server', ''):<40} auth={auth}  default org={org}")
+        return 0
+
+    print("=" * 60, file=info)
+    print("VMware Cloud Director Shadow VM Cleanup Tool", file=info)
+    print("=" * 60, file=info)
+
+    # Resolve a saved-server profile. The stored credential is used only to
+    # authenticate this shadow-VM scan/cleanup session; it is never printed.
+    token = args.token
+    username = args.username
+    password = args.password
+    if args.saved_server:
+        profile = _find_saved_server(args.saved_server)
+        if not profile:
+            names = ", ".join(s.get("name", "?") for s in _load_saved_servers()) or "(none)"
+            print(f"ERROR: No saved server matches '{args.saved_server}'. Saved servers: {names}", file=sys.stderr)
+            return 1
+        args.server = profile.get("server") or args.server
+        if profile.get("skip_ssl_verify", True):
+            args.skip_ssl_verify = True
+        if not args.tenant:
+            args.tenant = profile.get("org") or None
+        credential = _get_credential(profile.get("id", ""))
+        if credential:
+            if profile.get("auth_type") == "token":
+                token, username, password = credential, None, None
+            else:
+                token, username, password = None, profile.get("username", ""), credential
+        elif not (token or (username and password)):
+            print(f"ERROR: No stored credential found for saved server '{profile.get('name')}'. "
+                  f"Re-save it in the GUI (Manage Saved Servers) or pass --token / --username/--password.",
+                  file=sys.stderr)
+            return 1
+
+    if not (token or (username and password)):
+        print("ERROR: Provide --token, --username/--password, or --saved-server.", file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        print("\n*** DRY RUN MODE - No changes will be made ***\n", file=info)
+
+    client = VCDClient(args.server, verify_ssl=not args.skip_ssl_verify)
+
+    print(f"\nConnecting to {args.server}...", file=info)
+    with contextlib.redirect_stdout(info):
+        if token:
+            ok = client.authenticate_with_token(token, "system")
+        else:
+            ok = client.authenticate_with_credentials(username, password, "system")
+    if not ok:
+        print("ERROR: Authentication failed", file=sys.stderr)
+        return 1
+    print("Connected successfully!", file=info)
+
+    try:
+        # Discovery actions: list resources and exit without scanning.
+        if args.list_tenants or args.list_catalogs or args.list_datastores:
+            result = {}
+            with contextlib.redirect_stdout(info):
+                if args.list_tenants:
+                    result["tenants"] = [o.get("name", "") for o in client.get_organizations()]
+                if args.list_catalogs:
+                    result["catalogs"] = [
+                        {"name": c.get("name", ""), "org": c.get("orgName", "")}
+                        for c in client.get_catalogs(args.tenant)
+                    ]
+                if args.list_datastores:
+                    result["datastores"] = [d.get("name", "") for d in client.get_datastores()]
+            if as_json:
+                emit_json(result)
+            else:
+                if "tenants" in result:
+                    print("\nTenants/Organizations:")
+                    for name in result["tenants"]:
+                        print(f"  {name}")
+                if "catalogs" in result:
+                    print(f"\nCatalogs{' (org: ' + args.tenant + ')' if args.tenant else ''}:")
+                    for c in result["catalogs"]:
+                        print(f"  {c['name']}  (org: {c['org']})")
+                if "datastores" in result:
+                    print("\nDatastores:")
+                    for name in result["datastores"]:
+                        print(f"  {name}")
+            return 0
+
+        # Switch to tenant if specified
+        if args.tenant and args.tenant.lower() != "system":
+            print(f"Switching to tenant: {args.tenant}", file=info)
+            client.switch_to_org(args.tenant)
+
+        # Scan for Shadow VMs (support comma-separated catalog and datastore names from CLI)
+        catalog_names = [c.strip() for c in args.catalog.split(",") if c.strip()]
+        datastore_names = [d.strip() for d in args.datastore.split(",") if d.strip()]
+        with contextlib.redirect_stdout(info):
+            shadows = scan_shadow_vms(client, catalog_names, datastore_names,
+                                      vcd_server=args.server, org_name=args.tenant or "system",
+                                      debug=args.debug)
+
+        payload = {
+            "server": args.server,
+            "tenant": args.tenant or "system",
+            "catalogs": catalog_names,
+            "datastores": datastore_names,
+            "dry_run": bool(args.dry_run),
+            "count": len(shadows),
+            "shadow_vms": [
+                {
+                    "name": s.name,
+                    "parent_template": s.container_name,
+                    "catalog": s.catalog_name,
+                    "datastore": s.datastore_name,
+                    "href": s.href,
+                }
+                for s in shadows
+            ],
+        }
+
+        if not as_json:
+            print_shadow_vm_table(shadows)
+
+        if not shadows:
+            if as_json:
+                emit_json(payload)
+            return 0
+
+        if args.dry_run:
+            print("\n*** DRY RUN COMPLETE - No Shadow VMs were deleted ***", file=info)
+            if as_json:
+                emit_json(payload)
+            return 0
+
+        # Safety gate: deleting Shadow VMs is permanent. The CLI always requires
+        # an explicit typed confirmation here — there is deliberately no
+        # --yes/--force flag to bypass it. Use --dry-run for unattended analysis.
+        print(f"\nWARNING: About to PERMANENTLY delete {len(shadows)} Shadow VM(s) from {args.server}. "
+              f"This cannot be undone.", file=info)
+        print("Are you sure? Type 'yes' to confirm, anything else to cancel: ", file=info, end="", flush=True)
+        try:
+            response = input().strip().lower()
+        except EOFError:
+            response = ""
+            print("", file=info)
+        if response != "yes":
+            print("Operation cancelled. No Shadow VMs were deleted.", file=info)
+            if as_json:
+                payload["confirmed"] = False
+                emit_json(payload)
+            return 0
+
+        # Delete Shadow VMs
+        print("\nDeleting Shadow VMs...", file=info)
+        success_count = 0
+        fail_count = 0
+        results = []
+
+        for i, shadow in enumerate(shadows, 1):
+            print(f"  [{i}/{len(shadows)}] Deleting {shadow.name}...", end=" ", file=info, flush=True)
+            success, message = client.delete_shadow_vm(shadow)
+            if success:
+                print("OK", file=info)
+                success_count += 1
+            else:
+                print(f"FAILED - {message}", file=info)
+                fail_count += 1
+            results.append({"name": shadow.name, "href": shadow.href,
+                            "success": success, "message": message})
+            # Same rate-limit pause between deletes as the GUI delete worker
+            if i < len(shadows):
+                time.sleep(3)
+
+        print(f"\nDeletion complete: {success_count} succeeded, {fail_count} failed", file=info)
+        if as_json:
+            payload["confirmed"] = True
+            payload["succeeded"] = success_count
+            payload["failed"] = fail_count
+            payload["deletion_results"] = results
+            emit_json(payload)
+
+        return 0 if fail_count == 0 else 1
+    finally:
+        client.disconnect()
 
 
 def run_gui():
@@ -2926,50 +3084,96 @@ def main():
 Examples:
     # Run in GUI mode (default)
     python vcd_shadow_cleaner.py
-    
+
     # Run in CLI mode with API token
     python vcd_shadow_cleaner.py --cli --server vcd.example.com --token YOUR_API_TOKEN \\
         --tenant MyTenant --catalog MyCatalog --datastore MyDatastore
-    
+
+    # Use a connection profile saved from the GUI (credentials come from the
+    # system keyring and are only used to authenticate the scan/cleanup)
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \\
+        --catalog MyCatalog --datastore MyDatastore --dry-run
+
+    # List saved connection profiles / discover resource names
+    python vcd_shadow_cleaner.py --cli --list-servers
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \\
+        --list-tenants --list-catalogs --list-datastores
+
+    # Machine-readable output for scripts and AI agents
+    # (JSON on stdout, progress on stderr)
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \\
+        --catalog MyCatalog --datastore MyDatastore --dry-run --json
+
     # Run in CLI mode using environment variables (VCD_SERVER, VCD_TOKEN, etc.)
     # .env file is also supported
     python vcd_shadow_cleaner.py --cli --tenant MyTenant --catalog MyCatalog --datastore MyDatastore
+
+Deletion is permanent. Unless --dry-run is given, the CLI always asks
+"Are you sure?" and requires typing 'yes' before any Shadow VM is deleted;
+there is no flag to skip that confirmation.
         """
     )
 
     parser.add_argument("--cli", action="store_true", help="Run in command-line interface mode (default is GUI)")
-    
+
     # Connection args (can be loaded from env vars)
     parser.add_argument("--server", "-s", default=os.environ.get("VCD_SERVER"), help="VCD server hostname or IP")
     parser.add_argument("--token", "-t", default=os.environ.get("VCD_TOKEN"), help="VCD API token")
     parser.add_argument("--username", "-u", default=os.environ.get("VCD_USER"), help="VCD username (alternative to token)")
     parser.add_argument("--password", "-p", default=os.environ.get("VCD_PASSWORD"), help="VCD password (alternative to token)")
-    
+    parser.add_argument("--saved-server", "-S", metavar="NAME",
+                        help="Use a connection profile saved from the GUI, matched by display name, hostname, or id. "
+                             "Supplies the server, stored credential (from the system keyring), default org, and SSL "
+                             "setting. Stored credentials are only used to authenticate this shadow-VM scan/cleanup. "
+                             "Implies --cli.")
+    parser.add_argument("--list-servers", action="store_true",
+                        help="List saved server profiles (credentials are never shown) and exit. Implies --cli.")
+
     parser.add_argument("--tenant", default=os.environ.get("VCD_TENANT"), help="Target tenant/organization name")
-    parser.add_argument("--catalog", "-c", default=os.environ.get("VCD_CATALOG"), help="Catalog name to scan")
-    parser.add_argument("--datastore", "-d", default=os.environ.get("VCD_DATASTORE"), help="Datastore name to scan")
-    
+    parser.add_argument("--catalog", "-c", default=os.environ.get("VCD_CATALOG"), help="Catalog name(s) to scan, comma-separated")
+    parser.add_argument("--datastore", "-d", default=os.environ.get("VCD_DATASTORE"), help="Datastore name(s) to scan, comma-separated")
+
+    parser.add_argument("--list-tenants", action="store_true",
+                        help="Connect, list tenants/organizations, and exit. Implies --cli.")
+    parser.add_argument("--list-catalogs", action="store_true",
+                        help="Connect, list catalogs (filtered by --tenant if given), and exit. Implies --cli.")
+    parser.add_argument("--list-datastores", action="store_true",
+                        help="Connect, list datastores, and exit. Implies --cli.")
+
     parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without making changes")
+    parser.add_argument("--json", action="store_true",
+                        help="Print results as JSON on stdout (progress goes to stderr); for scripts and AI agents")
+    parser.add_argument("--debug", action="store_true", help="Enable verbose debug output during the scan")
     parser.add_argument("--skip-ssl-verify", action="store_true", default=os.environ.get("VCD_SKIP_SSL", "false").lower() == "true", help="Skip SSL certificate verification")
-    
+
     args = parser.parse_args()
-    
-    # Default to GUI if --cli is not specified
-    if not args.cli:
+
+    # CLI-only actions imply --cli; otherwise default to GUI
+    cli_mode = (args.cli or args.saved_server or args.list_servers
+                or args.list_tenants or args.list_catalogs or args.list_datastores)
+    if not cli_mode:
         return run_gui()
-    else:
-        # CLI mode requires certain arguments
-        if not args.server:
-            print("ERROR: --server is required in CLI mode (or set VCD_SERVER env var).")
-            return 1
+
+    # --list-servers only reads the local profile store; no connection args needed
+    if args.list_servers:
+        return run_cli(args)
+
+    if not args.server and not args.saved_server:
+        print("ERROR: --server is required in CLI mode (or set VCD_SERVER env var, or use --saved-server).")
+        return 1
+
+    # Catalog/datastore are only required for an actual scan, not for discovery
+    if not (args.list_tenants or args.list_catalogs or args.list_datastores):
         if not args.catalog:
-            print("ERROR: --catalog is required in CLI mode (or set VCD_CATALOG env var).")
+            print("ERROR: --catalog is required in CLI mode (or set VCD_CATALOG env var). "
+                  "Use --list-catalogs to discover catalog names.")
             return 1
         if not args.datastore:
-            print("ERROR: --datastore is required in CLI mode (or set VCD_DATASTORE env var).")
+            print("ERROR: --datastore is required in CLI mode (or set VCD_DATASTORE env var). "
+                  "Use --list-datastores to discover datastore names.")
             return 1
-        
-        return run_cli(args)
+
+    return run_cli(args)
 
 
 if __name__ == "__main__":

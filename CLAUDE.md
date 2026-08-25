@@ -11,11 +11,19 @@ source venv/bin/activate
 # GUI mode (default)
 python vcd_shadow_cleaner.py
 
-# CLI mode (untested/not recommended for production use)
+# CLI mode
 python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
     --tenant <tenant_name> --catalog <catalog_name> --datastore <datastore_name> \
-    [--dry-run] [--skip-ssl-verify]
+    [--dry-run] [--json] [--skip-ssl-verify]
+
+# CLI mode with a saved server profile (created in the GUI; credential from OS keyring)
+python vcd_shadow_cleaner.py --cli --saved-server "<profile_name>" \
+    --catalog <catalog_name> --datastore <datastore_name> [--dry-run] [--json]
+
+# Discovery (each implies --cli): --list-servers, --list-tenants, --list-catalogs, --list-datastores
 ```
+
+CLI safety: unless `--dry-run` is given, the CLI always prompts "Are you sure?" and requires typing `yes` before deleting; there is deliberately no `--yes`/`--force` bypass flag. `--json` prints machine-readable results on stdout and moves all progress output to stderr. Saved-server credentials are used only to authenticate the shadow-VM scan/cleanup session.
 
 ## Building standalone executables
 

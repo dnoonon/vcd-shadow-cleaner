@@ -62,17 +62,42 @@ python vcd_shadow_cleaner.py
 
 The GUI will launch, allowing you to enter your VCD server details, authenticate, and then scan and clean up Shadow VMs.
 
-### CLI Mode - UNTESTED and NOT RECOMMENDED
+### CLI Mode
 
-Use the `--cli` flag along with the required arguments. You can provide connection details via command-line arguments or by setting environment variables (e.g., `VCD_SERVER`, `VCD_TOKEN`, `VCD_USER`, `VCD_PASSWORD`, `VCD_TENANT`, `VCD_CATALOG`, `VCD_DATASTORE`). A `.env` file is also supported for loading environment variables.
+Use the `--cli` flag along with the required arguments. Connection details can come from three places (in order of precedence): command-line arguments, environment variables (`VCD_SERVER`, `VCD_TOKEN`, `VCD_USER`, `VCD_PASSWORD`, `VCD_TENANT`, `VCD_CATALOG`, `VCD_DATASTORE`; a `.env` file is also supported), or a **saved server profile** created in the GUI (`--saved-server`).
 
 ```bash
 python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
     --tenant <tenant_name> --catalog <catalog_name> --datastore <datastore_name> \
-    [--dry-run] [--skip-ssl-verify]
+    [--dry-run] [--json] [--skip-ssl-verify]
 ```
 
+> [!IMPORTANT]
+> Deletion is permanent. Unless `--dry-run` is given, the CLI always asks **"Are you sure?"** and requires typing `yes` before any Shadow VM is deleted. There is deliberately no flag to skip that confirmation — use `--dry-run` for unattended analysis.
+
+**Using stored credentials:** server profiles saved in the GUI (Manage Saved Servers) can be reused from the CLI with `--saved-server <name>`. The profile supplies the server hostname, the stored credential (retrieved from the OS keyring), the default org, and the SSL setting. Stored credentials are only ever used to authenticate the shadow-VM scan/cleanup session — they are never printed or used for anything else.
+
 **Examples:**
+
+* **List saved server profiles (credentials are never shown):**
+
+    ```bash
+    python vcd_shadow_cleaner.py --list-servers
+    ```
+
+* **Dry run using a saved server profile:**
+
+    ```bash
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \
+        --catalog MyCatalog --datastore MyDatastore --dry-run
+    ```
+
+* **Discover tenant, catalog, and datastore names before scanning:**
+
+    ```bash
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \
+        --list-tenants --list-catalogs --list-datastores
+    ```
 
 * **Dry Run with API Token:**
 
@@ -88,11 +113,20 @@ python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
         --tenant MyTenant --catalog MyCatalog --datastore MyDatastore
     ```
 
+* **Machine-readable output for scripts and AI agents** (JSON on stdout, progress on stderr):
+
+    ```bash
+    python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \
+        --catalog MyCatalog --datastore MyDatastore --dry-run --json
+    ```
+
 * **Display Help Information:**
 
     ```bash
     python vcd_shadow_cleaner.py --help
     ```
+
+Multiple catalogs or datastores can be scanned in one run by passing comma-separated names to `--catalog` / `--datastore`. During deletion the CLI pauses 3 seconds between VMs (same rate limiting as the GUI).
 
 ## Workflow
 
@@ -100,7 +134,7 @@ python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
 graph TD
     A[Start Application] --> B{GUI or CLI?};
     B -- GUI (Default) --> C[Initialize GUI];
-    B -- CLI (Not Recommended) --> D[Parse CLI Arguments];
+    B -- CLI --> D[Parse CLI Arguments];
     C --> E{Connect to VCD};
     D --> E;
     E -- Connection Successful --> F[Load Tenants, Catalogs, Datastores];
