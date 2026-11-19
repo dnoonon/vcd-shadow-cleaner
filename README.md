@@ -8,6 +8,8 @@ A Python application for managing Shadow VMs in VMware Cloud Director. This tool
 
 > [!CAUTION]
 > This script is designed to DELETE content from VMware Cloud Director. Deletion will not occur until you click the "Yes" button on the confirmation popup that appears when you click the Cleanup Shadows button. Verify and re-verify before proceeding since the delete will be a permanent action that cannot be undone.
+>
+> The results table has a **Match** column. *exact* means the Shadow VM's parent template reference is one of the selected templates; *name* and *substring* are **weak** matches found only from names, and can be wrong. The header and group checkboxes select only exact matches unless **Include weak matches in bulk select** is on; weak rows can always be checked one by one. Only checked rows that are visible under the current filters are deleted, and the confirmation shows the exact/weak counts and how many hidden checked rows were skipped.
 
 ![Delete Confirmation](images/image-3.png)
 
@@ -69,11 +71,17 @@ Use the `--cli` flag along with the required arguments. Connection details can c
 ```bash
 python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
     --tenant <tenant_name> --catalog <catalog_name> --datastore <datastore_name> \
-    [--dry-run] [--json] [--skip-ssl-verify]
+    [--dry-run] [--include-weak] [--json] [--skip-ssl-verify]
 ```
 
 > [!IMPORTANT]
-> Deletion is permanent. Unless `--dry-run` is given, the CLI always asks **"Are you sure?"** and requires typing `yes` before any Shadow VM is deleted. There is deliberately no flag to skip that confirmation — use `--dry-run` for unattended analysis.
+> Deletion is permanent. Unless `--dry-run` is given, the CLI asks **"Are you sure?"** on the controlling terminal (`/dev/tty`, or `CONIN$` on Windows) and requires typing `yes`. The answer is never read from stdin, so piping `yes` into the tool cannot confirm a delete; with no terminal the CLI refuses to delete and exits 5. There is deliberately no flag to skip the confirmation — use `--dry-run` for unattended analysis.
+>
+> By default the CLI deletes only **exact** matches (the Shadow VM's parent template reference is one of the selected templates). `--include-weak` adds **name** and **substring** matches, which the confirmation lists separately. A Shadow VM whose parent reference points at a template outside the selection is never matched by name.
+
+**Exit codes:** 0 success; 1 internal or usage error; 2 catalog or datastore name not found; 3 authentication failed; 4 VCD or network error (results incomplete, nothing deleted; JSON has `"complete": false` and `errors`); 5 delete refused (no terminal); 7 some deletes failed, timed out, or were skipped after the run stopped.
+
+**Deletes:** when VCD returns a task, the tool polls it and reports the real outcome; a delete accepted without a task is reported as *accepted, not verified*. The run stops after 3 failures in a row or on any 401/403.
 
 **Using stored credentials:** server profiles saved in the GUI (Manage Saved Servers) can be reused from the CLI with `--saved-server <name>`. The profile supplies the server hostname, the stored credential (retrieved from the OS keyring), the default org, and the SSL setting. Stored credentials are only ever used to authenticate the shadow-VM scan/cleanup session — they are never printed or used for anything else.
 
@@ -126,7 +134,16 @@ python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
     python vcd_shadow_cleaner.py --help
     ```
 
-Multiple catalogs or datastores can be scanned in one run by passing comma-separated names to `--catalog` / `--datastore`. During deletion the CLI pauses 3 seconds between VMs (same rate limiting as the GUI).
+Multiple catalogs or datastores can be scanned in one run by passing comma-separated names to `--catalog` / `--datastore`. Names are resolved against the discovered catalogs (in `--tenant`'s org, when given) and datastores, so results stay scoped to that org and vCenter. During deletion the CLI pauses 3 seconds between VMs (same rate limiting as the GUI).
+
+### Tests
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+python -m pytest -q tests
+```
+
+The tests run offline against a fake VCD session; the GUI test runs offscreen and is skipped when PySide6 is missing.
 
 ## Workflow
 
