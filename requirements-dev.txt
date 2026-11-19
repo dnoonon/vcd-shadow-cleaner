@@ -1,0 +1,2 @@
+# Test dependencies (install alongside requirements.txt)
+pytest>=7.0

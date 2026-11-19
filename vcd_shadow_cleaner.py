@@ -28,11 +28,15 @@ import argparse
 import contextlib
 import sys
 import json
+import logging
+import re
+import tempfile
 import urllib3
 import os
 import time
 import uuid
 import base64
+from urllib.parse import quote, urlencode, urljoin
 
 try:
     import keyring
@@ -44,14 +48,138 @@ _CONFIG_DIR = os.path.expanduser("~/.vcd-shadow-cleaner")
 _SERVERS_FILE = os.path.join(_CONFIG_DIR, "servers.json")
 _KEYRING_SERVICE = "vcd-shadow-cleaner"
 
-from dataclasses import dataclass
-from typing import Optional, List, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Set, Tuple, Callable
 from datetime import datetime
 
 import requests
 
 # Suppress SSL warnings for development (should be removed in production)
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+_logger = logging.getLogger("vcd_shadow_cleaner")
+
+# ---- HTTP behaviour ----
+HTTP_TIMEOUT = (10, 60)                      # (connect, read) seconds, on every request
+RETRY_STATUSES = frozenset({429, 502, 503, 504})
+GET_MAX_ATTEMPTS = 3                         # GETs only; never retried for POST/DELETE
+RETRY_BACKOFF_SECONDS = 1.0                  # 1 s, 2 s, ... (Retry-After honoured, capped)
+PAGE_SIZE = 100
+MAX_PAGES = 10000
+
+# ---- Delete behaviour ----
+DELETE_DELAY_SECONDS = 3                     # pause between deletes (VCD rate limits)
+MAX_CONSECUTIVE_DELETE_FAILURES = 3
+TASK_POLL_INTERVAL_SECONDS = 2.0
+TASK_TIMEOUT_SECONDS = 300.0
+_TASK_FAILED_STATES = {"error", "aborted", "canceled", "cancelled"}
+
+# ---- CLI exit codes ----
+EXIT_OK = 0
+EXIT_ERROR = 1
+EXIT_USAGE = 2
+EXIT_AUTH = 3            # authentication failed
+EXIT_VCD = 4             # VCD or network error; results incomplete
+EXIT_NO_TERMINAL = 5     # delete refused: no terminal to confirm on
+EXIT_DELETE_FAILED = 7   # some deletes failed, timed out, or were skipped after a stop
+
+MATCH_EXACT = "exact"
+MATCH_NAME = "name"
+MATCH_SUBSTRING = "substring"
+WEAK_MATCHES = (MATCH_NAME, MATCH_SUBSTRING)
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can skip real waiting."""
+    time.sleep(seconds)
+
+
+def _monotonic() -> float:
+    return time.monotonic()
+
+
+def normalize_host(host: Optional[str]) -> str:
+    """Strip whitespace, an http(s):// scheme and trailing slashes from a server address."""
+    h = (host or "").strip()
+    low = h.lower()
+    for scheme in ("https://", "http://"):
+        if low.startswith(scheme):
+            h = h[len(scheme):]
+            break
+    return h.rstrip("/")
+
+
+class VCDError(Exception):
+    """Base error for VCD calls. Carries the stage, the target and the HTTP status."""
+
+    def __init__(self, message: str, *, stage: str = "", target: str = "", status: Optional[int] = None):
+        super().__init__(message)
+        self.stage = stage
+        self.target = target
+        self.status = status
+
+    def to_dict(self) -> dict:
+        return {
+            "type": type(self).__name__,
+            "stage": self.stage,
+            "target": self.target,
+            "http_status": self.status,
+            "message": str(self),
+        }
+
+
+class VCDAuthError(VCDError):
+    """Authentication failed (bad credentials, or no access token returned)."""
+
+
+class VCDQueryError(VCDError):
+    """A VCD request failed: HTTP error, network error, bad response, or incomplete paging."""
+
+
+# Characters that VCD's query filter syntax may interpret. A name containing one is
+# never sent in a server-side filter; the records are filtered client-side instead.
+_FIQL_SPECIAL = set(';,()=!<>~*"\'\\')
+_UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+# Token boundaries for name/substring matching.
+_NAME_BOUNDARY = set("-_ .()")
+
+
+def _fiql_safe(value: str) -> bool:
+    return bool(value) and not any(c in _FIQL_SPECIAL for c in value)
+
+
+def _ref_key(value) -> str:
+    """Comparable key for an href/urn/name: the embedded UUID if any, else the lower-cased string."""
+    s = str(value or "").strip().lower().rstrip("/")
+    m = _UUID_RE.search(s)
+    return m.group(0) if m else s
+
+
+def _looks_like_ref(value) -> bool:
+    return isinstance(value, str) and (
+        value.startswith("http://") or value.startswith("https://")
+        or value.startswith("urn:") or "/api/" in value
+    )
+
+
+def _scope_check(record: dict, ident: dict, pairs) -> Optional[bool]:
+    """Compare a record with a discovered identity.
+
+    pairs: (record_field, identity_field) tuples. Returns True when every comparable
+    pair matches, False when one differs, None when no pair could be compared.
+    """
+    compared = False
+    for rec_key, ident_key in pairs:
+        rv = record.get(rec_key)
+        iv = ident.get(ident_key)
+        if not rv or not iv or iv == "N/A":
+            continue
+        if rec_key.endswith("Name") and _looks_like_ref(iv):
+            continue  # display fallback holds an href, not a name
+        compared = True
+        if _ref_key(rv) != _ref_key(iv):
+            return False
+    return True if compared else None
 
 
 def load_env_file(env_path: str = ".env"):
@@ -68,23 +196,23 @@ def load_env_file(env_path: str = ".env"):
                 line = line.strip()
                 if not line or line.startswith("#"):
                     continue
-                
+
                 # Split on first =
                 if "=" in line:
                     key, value = line.split("=", 1)
                     key = key.strip()
                     value = value.strip()
-                    
+
                     # Remove quotes if present
                     if (value.startswith('"') and value.endswith('"')) or \
                        (value.startswith("'") and value.endswith("'")):
                         value = value[1:-1]
-                    
+
                     # Set env var if not already set
                     if key not in os.environ:
                         os.environ[key] = value
     except Exception as e:
-        print(f"Warning: Failed to load .env file: {e}")
+        print(f"Warning: Failed to load .env file: {e}", file=sys.stderr)
 
 
 def _load_saved_servers() -> list:
@@ -98,19 +226,37 @@ def _load_saved_servers() -> list:
 
 
 def _persist_saved_servers(servers: list) -> None:
+    """Write servers.json atomically (temp file + rename) with mode 0600."""
     os.makedirs(_CONFIG_DIR, exist_ok=True)
-    with open(_SERVERS_FILE, "w") as f:
-        json.dump(servers, f, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=_CONFIG_DIR, prefix=".servers.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(servers, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, _SERVERS_FILE)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+    with contextlib.suppress(OSError):
+        os.chmod(_SERVERS_FILE, 0o600)
 
 
 def _get_credential(server_id: str) -> str:
-    """Return stored password/token for a saved server, or empty string."""
+    """Return stored password/token for a saved server, or empty string.
+
+    Tries the keyring first and falls back to the base64 store in servers.json when
+    the keyring is unavailable, fails, or has nothing for this server.
+    """
     if _KEYRING_AVAILABLE:
         try:
             result = keyring.get_password(_KEYRING_SERVICE, server_id)
-            return result or ""
+            if result:
+                return result
         except Exception:
-            return ""
+            pass
     # fallback: base64 in JSON
     for s in _load_saved_servers():
         if s.get("id") == server_id:
@@ -166,8 +312,9 @@ def _find_saved_server(name_or_id: str) -> Optional[dict]:
     for s in servers:
         if s.get("name", "").strip().lower() == needle:
             return s
+    host_needle = normalize_host(name_or_id).lower()
     for s in servers:
-        if s.get("server", "").strip().lower() == needle:
+        if normalize_host(s.get("server", "")).lower() == host_needle:
             return s
     return None
 
@@ -178,13 +325,28 @@ class ShadowVM:
     name: str
     href: str
     container_name: str  # Parent vApp Template name (if resolved)
-    container_id: str    # Parent vApp Template ID/HREF
+    container_id: str    # Parent vApp Template ID/HREF (any reference field the record carries)
     datastore_name: str
     vm_id: str
     primary_vm_href: str # Link to the primary VM
     catalog_name: str = ""
     vcd_server: str = ""
     org_name: str = ""
+    # Authoritative parent template reference (primaryVAppTemplate / vAppTemplate), if any
+    parent_ref: str = ""
+    # True when container_name came from a record field rather than the shadow's name
+    container_name_from_field: bool = False
+    datastore_href: str = ""
+    vc_name: str = ""
+    # Match evidence, filled in by scan_shadow_vms
+    match_strength: str = ""     # exact | name | substring
+    match_rule: str = ""         # parent_ref | container_name | name_prefix | name_token
+    template_href: str = ""      # href of the matched template
+    ambiguous_with: List[dict] = field(default_factory=list)
+
+    @property
+    def is_weak(self) -> bool:
+        return self.match_strength in WEAK_MATCHES
 
 
 @dataclass
@@ -194,19 +356,123 @@ class VAppTemplate:
     href: str
     id: str
     catalog_name: str
+    org_href: str = ""
+    org_name: str = ""
+    catalog_href: str = ""
+
+
+@dataclass
+class DeleteResult:
+    """Outcome of one shadow VM delete.
+
+    status: deleted (VCD confirmed: 204 or task success), accepted_unverified (accepted,
+    no task to confirm), failed, timeout (task did not finish in time), skipped (not tried).
+    """
+    shadow: ShadowVM
+    status: str
+    message: str
+    http_status: Optional[int] = None
+    task_href: str = ""
+    task_status: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return self.status in ("deleted", "accepted_unverified")
+
+    def to_dict(self) -> dict:
+        return {
+            "name": self.shadow.name,
+            "href": self.shadow.href,
+            "status": self.status,
+            "success": self.ok,
+            "message": self.message,
+            "http_status": self.http_status,
+            "task": {"href": self.task_href, "status": self.task_status} if self.task_href else None,
+        }
+
+
+@dataclass
+class DeleteRun:
+    results: List[DeleteResult] = field(default_factory=list)
+    stopped_reason: str = ""
+
+    def count(self, *statuses) -> int:
+        return sum(1 for r in self.results if r.status in statuses)
+
+    @property
+    def deleted(self) -> int:
+        return self.count("deleted")
+
+    @property
+    def unverified(self) -> int:
+        return self.count("accepted_unverified")
+
+    @property
+    def failed(self) -> int:
+        return self.count("failed", "timeout")
+
+    @property
+    def skipped(self) -> int:
+        return self.count("skipped")
+
+
+@dataclass
+class ScanResult:
+    """Result of scan_shadow_vms: matched shadows plus the scan's completeness."""
+    shadows: List[ShadowVM] = field(default_factory=list)   # exact + weak matches
+    other_template: int = 0       # parent reference set, pointing at an unselected template
+    unmatched: int = 0            # no parent reference and no name match
+    errors: List[dict] = field(default_factory=list)
+    warnings: List[str] = field(default_factory=list)
+
+    @property
+    def complete(self) -> bool:
+        return not self.errors
+
+    @property
+    def counts(self) -> dict:
+        exact = sum(1 for s in self.shadows if s.match_strength == MATCH_EXACT)
+        name = sum(1 for s in self.shadows if s.match_strength == MATCH_NAME)
+        sub = sum(1 for s in self.shadows if s.match_strength == MATCH_SUBSTRING)
+        return {
+            "exact": exact,
+            "name": name,
+            "substring": sub,
+            "weak": name + sub,
+            "ambiguous": sum(1 for s in self.shadows if s.ambiguous_with),
+            "other_template": self.other_template,
+            "unmatched": self.unmatched,
+        }
+
+    def extend(self, other: "ScanResult") -> None:
+        self.shadows.extend(other.shadows)
+        self.other_template += other.other_template
+        self.unmatched += other.unmatched
+        self.errors.extend(other.errors)
+        self.warnings.extend(other.warnings)
+
+
+def format_error(err) -> str:
+    if isinstance(err, dict):
+        prefix = f"[{err['server']}] " if err.get("server") else ""
+        return prefix + str(err.get("message", err))
+    return str(err)
 
 
 class VCDClient:
     """VMware Cloud Director API Client."""
 
     def __init__(self, host: str, verify_ssl: bool = False):
-        self.host = host.rstrip('/')
+        self.host = normalize_host(host)
         self.verify_ssl = verify_ssl
         self.session = requests.Session()
         self.session.verify = verify_ssl
         self.access_token: Optional[str] = None
         self.api_version = "38.0"  # VCD API version
         self.current_org: Optional[str] = None
+
+    def _url(self, path: str) -> str:
+        return f"https://{self.host}{path}"
 
     def _get_headers(self) -> dict:
         """Get common API headers."""
@@ -218,572 +484,825 @@ class VCDClient:
             headers["Authorization"] = f"Bearer {self.access_token}"
         return headers
 
+    # ---- low-level HTTP ----
+
+    def _request(self, method: str, url: str, *, stage: str, target: str, params=None,
+                 headers: Optional[dict] = None, retry: Optional[bool] = None, **kwargs):
+        """Send one request with a timeout. GETs are retried on 429/502/503/504.
+
+        Returns the response (any status). Network errors raise VCDQueryError.
+        """
+        if headers is None:
+            headers = self._get_headers()
+        if isinstance(params, dict):
+            # Encode every value (spaces as %20, & and # escaped); keep '==' readable.
+            params = urlencode(params, quote_via=quote, safe="=")
+        method = method.upper()
+        retryable = (method == "GET") if retry is None else retry
+        attempts = GET_MAX_ATTEMPTS if retryable else 1
+        for attempt in range(1, attempts + 1):
+            try:
+                resp = self.session.request(method, url, params=params, headers=headers,
+                                            timeout=HTTP_TIMEOUT, **kwargs)
+            except requests.exceptions.RequestException as e:
+                raise VCDQueryError(f"{stage} failed for {target}: {type(e).__name__}: {e}",
+                                    stage=stage, target=target) from e
+            if resp.status_code in RETRY_STATUSES and attempt < attempts:
+                delay = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                retry_after = (getattr(resp, "headers", None) or {}).get("Retry-After")
+                if retry_after and str(retry_after).isdigit():
+                    delay = min(float(retry_after), 30.0)
+                _logger.debug("%s %s -> HTTP %s; retry %d/%d in %.1fs",
+                              method, url, resp.status_code, attempt, attempts - 1, delay)
+                _sleep(delay)
+                continue
+            return resp
+        return resp  # pragma: no cover - loop always returns
+
+    @staticmethod
+    def _body_snippet(resp, limit: int = 300) -> str:
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        text = " ".join(str(text).split())
+        return text[:limit]
+
+    def _raise_for_status(self, resp, stage: str, target: str) -> None:
+        if resp.status_code >= 400:
+            snippet = self._body_snippet(resp)
+            raise VCDQueryError(
+                f"{stage} failed for {target}: HTTP {resp.status_code}" + (f": {snippet}" if snippet else ""),
+                stage=stage, target=target, status=resp.status_code,
+            )
+
+    def _get_json(self, url: str, *, stage: str, target: str, params=None) -> dict:
+        resp = self._request("GET", url, stage=stage, target=target, params=params)
+        self._raise_for_status(resp, stage, target)
+        try:
+            data = resp.json()
+        except ValueError as e:
+            raise VCDQueryError(f"{stage} failed for {target}: response is not JSON",
+                                stage=stage, target=target, status=resp.status_code) from e
+        if not isinstance(data, dict):
+            raise VCDQueryError(f"{stage} failed for {target}: unexpected response shape",
+                                stage=stage, target=target, status=resp.status_code)
+        return data
+
+    def _query_records(self, query_type: str, *, stage: str, target: str,
+                       filters: Optional[List[Tuple[str, str]]] = None) -> List[dict]:
+        """Fetch every record of a typed query, page by page, sorted by name.
+
+        Paging continues while fetched < total. A failure on any page raises; a partial
+        list is never returned. Filter values with filter-syntax characters are not sent
+        (callers filter those records client-side).
+        """
+        params = {"type": query_type, "format": "records", "pageSize": PAGE_SIZE, "sortAsc": "name"}
+        fiql = [f"{fld}=={val}" for fld, val in (filters or []) if _fiql_safe(val)]
+        if fiql:
+            params["filter"] = ";".join(fiql)
+        skipped = [val for _, val in (filters or []) if not _fiql_safe(val)]
+        if skipped:
+            _logger.debug("query %s: not sending filter values %r server-side; filtering client-side",
+                          query_type, skipped)
+        url = self._url("/api/query")
+        records: List[dict] = []
+        page = 1
+        while True:
+            params["page"] = page
+            data = self._get_json(url, stage=stage, target=f"{target} (page {page})", params=params)
+            page_records = data.get("record") or []
+            if not isinstance(page_records, list):
+                raise VCDQueryError(f"{stage} failed for {target}: 'record' is not a list",
+                                    stage=stage, target=target)
+            records.extend(page_records)
+            try:
+                total = int(data["total"])
+            except (KeyError, TypeError, ValueError):
+                total = None
+            if total is None:
+                if not page_records:
+                    break
+            else:
+                if len(records) >= total:
+                    break
+                if not page_records:
+                    raise VCDQueryError(
+                        f"{stage} failed for {target}: paging stopped at page {page} with "
+                        f"{len(records)} of {total} records",
+                        stage=stage, target=target,
+                    )
+            page += 1
+            if page > MAX_PAGES:
+                raise VCDQueryError(f"{stage} failed for {target}: more than {MAX_PAGES} pages",
+                                    stage=stage, target=target)
+        return records
+
+    # ---- authentication ----
+
+    @staticmethod
+    def _auth_user(username: str, org: str) -> str:
+        if "@" in username:
+            return username
+        return f"{username}@{'system' if org.lower() == 'system' else org}"
+
     def authenticate_with_token(self, api_token: str, org: str = "system") -> bool:
         """
-        Authenticate to VCD using an API token.
-        
-        Args:
-            api_token: The VCD API refresh token
-            org: The organization ('system' for provider login)
-            
-        Returns:
-            True if authentication successful, False otherwise
+        Authenticate to VCD using an API token (refresh token).
+
+        Returns True on success. Raises VCDAuthError when VCD rejects the token or
+        returns no access_token, VCDQueryError on network/server errors.
         """
+        if org.lower() == "system":
+            uri = self._url("/oauth/provider/token")
+        else:
+            uri = self._url(f"/oauth/tenant/{quote(org, safe='')}/token")
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        resp = self._request("POST", uri, stage="auth", target="token", headers=headers,
+                             data={"grant_type": "refresh_token", "refresh_token": api_token})
+        if resp.status_code in (400, 401, 403):
+            raise VCDAuthError(f"Token authentication failed: HTTP {resp.status_code}",
+                               stage="auth", target="token", status=resp.status_code)
+        self._raise_for_status(resp, "auth", "token")
         try:
-            if org.lower() == "system":
-                uri = f"https://{self.host}/oauth/provider/token"
-            else:
-                uri = f"https://{self.host}/oauth/tenant/{org}/token"
-
-            body = f"grant_type=refresh_token&refresh_token={api_token}"
-            headers = {
-                "Accept": "application/json",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-
-            response = self.session.post(uri, headers=headers, data=body)
-            response.raise_for_status()
-
-            data = response.json()
-            self.access_token = data.get("access_token")
-            self.current_org = org
-            return True
-        except Exception as e:
-            print(f"Authentication failed: {e}")
-            return False
+            data = resp.json()
+        except ValueError:
+            data = {}
+        token = data.get("access_token") if isinstance(data, dict) else None
+        if not token:
+            raise VCDAuthError("Token authentication failed: the server returned no access_token",
+                               stage="auth", target="token", status=resp.status_code)
+        self.access_token = token
+        self.current_org = org
+        return True
 
     def authenticate_with_credentials(self, username: str, password: str, org: str = "system") -> bool:
         """
         Authenticate to VCD using username and password.
-        
-        Tries multiple authentication methods in order:
-        1. CloudAPI sessions (modern VCD 10.x+)
-        2. Legacy /api/sessions
-        
-        Args:
-            username: VCD username
-            password: VCD password
-            org: The organization ('system' for provider login)
-            
-        Returns:
-            True if authentication successful, False otherwise
+
+        Tries CloudAPI sessions (VCD 10.x+), then legacy /api/sessions. Returns True on
+        success; raises VCDAuthError if both fail, VCDQueryError on network errors.
         """
-        # Try CloudAPI sessions first (VCD 10.x+)
-        if self._authenticate_cloudapi(username, password, org):
-            return True
-        
-        # Try legacy /api/sessions
-        if self._authenticate_legacy(username, password, org):
-            return True
-        
-        print("All authentication methods failed.")
-        return False
+        failures = []
+        try:
+            return self._authenticate_cloudapi(username, password, org)
+        except VCDAuthError as e:
+            failures.append(str(e))
+        try:
+            return self._authenticate_legacy(username, password, org)
+        except VCDAuthError as e:
+            failures.append(str(e))
+        raise VCDAuthError("All authentication methods failed: " + "; ".join(failures), stage="auth",
+                           target="credentials")
 
     def _authenticate_cloudapi(self, username: str, password: str, org: str = "system") -> bool:
         """
         Modern CloudAPI authentication using /cloudapi/1.0.0/sessions.
         Works with VCD 10.x and later.
         """
-        try:
-            # For provider (system) login, use /cloudapi/1.0.0/sessions/provider
-            if org.lower() == "system":
-                uri = f"https://{self.host}/cloudapi/1.0.0/sessions/provider"
-            else:
-                uri = f"https://{self.host}/cloudapi/1.0.0/sessions"
-
-            headers = {
-                "Accept": f"application/json;version={self.api_version}",
-                "Content-Type": "application/json"
-            }
-
-            # Use Basic Auth
-            import base64
-            if org.lower() == "system":
-                auth_string = f"{username}@system"
-            else:
-                auth_string = f"{username}@{org}"
-            
-            credentials = base64.b64encode(f"{auth_string}:{password}".encode()).decode()
-            headers["Authorization"] = f"Basic {credentials}"
-
-            response = self.session.post(uri, headers=headers)
-            response.raise_for_status()
-
-            # Get the access token from response header
-            self.access_token = response.headers.get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
-            if not self.access_token:
-                # Try getting from response body
-                try:
-                    data = response.json()
-                    self.access_token = data.get("accessToken") or data.get("token")
-                except:
-                    pass
-            
-            if self.access_token:
-                self.current_org = org
-                print(f"CloudAPI authentication successful")
-                return True
-            else:
-                print("CloudAPI auth: No access token in response")
-                return False
-                
-        except requests.exceptions.HTTPError as e:
-            print(f"CloudAPI authentication failed: {e}")
-            return False
-        except Exception as e:
-            print(f"CloudAPI authentication error: {e}")
-            return False
+        if org.lower() == "system":
+            uri = self._url("/cloudapi/1.0.0/sessions/provider")
+        else:
+            uri = self._url("/cloudapi/1.0.0/sessions")
+        credentials = base64.b64encode(f"{self._auth_user(username, org)}:{password}".encode()).decode()
+        headers = {
+            "Accept": f"application/json;version={self.api_version}",
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {credentials}",
+        }
+        resp = self._request("POST", uri, stage="auth", target="cloudapi session", headers=headers)
+        if resp.status_code >= 400:
+            raise VCDAuthError(f"CloudAPI authentication failed: HTTP {resp.status_code}",
+                               stage="auth", target="cloudapi session", status=resp.status_code)
+        token = (resp.headers or {}).get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
+        if not token:
+            try:
+                data = resp.json()
+                if isinstance(data, dict):
+                    token = data.get("accessToken") or data.get("token")
+            except ValueError:
+                pass
+        if not token:
+            raise VCDAuthError("CloudAPI authentication failed: no access token in response",
+                               stage="auth", target="cloudapi session", status=resp.status_code)
+        self.access_token = token
+        self.current_org = org
+        return True
 
     def _authenticate_legacy(self, username: str, password: str, org: str = "system") -> bool:
         """
         Legacy authentication using /api/sessions (for older VCD versions).
         """
-        try:
-            uri = f"https://{self.host}/api/sessions"
-            
-            # For system org, use username@system format
-            if org.lower() == "system":
-                auth_user = f"{username}@system"
-            else:
-                auth_user = f"{username}@{org}"
+        uri = self._url("/api/sessions")
+        headers = {"Accept": f"application/*+json;version={self.api_version}"}
+        resp = self._request("POST", uri, stage="auth", target="legacy session", headers=headers,
+                             auth=(self._auth_user(username, org), password))
+        if resp.status_code in (400, 401, 403):
+            raise VCDAuthError(f"Legacy authentication failed: HTTP {resp.status_code}",
+                               stage="auth", target="legacy session", status=resp.status_code)
+        self._raise_for_status(resp, "auth", "legacy session")
+        token = (resp.headers or {}).get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
+        if not token:
+            raise VCDAuthError("Legacy authentication failed: no access token in response",
+                               stage="auth", target="legacy session", status=resp.status_code)
+        self.access_token = token
+        self.current_org = org
+        return True
 
-            headers = {
-                "Accept": f"application/*+json;version={self.api_version}",
-            }
-
-            response = self.session.post(
-                uri, 
-                headers=headers, 
-                auth=(auth_user, password)
-            )
-            response.raise_for_status()
-
-            # Get the auth token from header
-            self.access_token = response.headers.get("X-VMWARE-VCLOUD-ACCESS-TOKEN")
-            self.current_org = org
-            print("Legacy authentication successful")
-            return True
-        except Exception as e:
-            print(f"Legacy authentication failed: {e}")
-            return False
+    # ---- discovery ----
 
     def get_organizations(self) -> List[dict]:
         """Get list of organizations (tenants) visible to the authenticated user."""
-        try:
-            uri = f"https://{self.host}/api/org"
-            response = self.session.get(uri, headers=self._get_headers())
-            response.raise_for_status()
-            
-            data = response.json()
-            orgs = []
-            for org in data.get("org", []):
-                orgs.append({
-                    "name": org.get("name"),
-                    "href": org.get("href")
-                })
-            return sorted(orgs, key=lambda x: x.get("name", ""))
-        except Exception as e:
-            print(f"Failed to get organizations: {e}")
-            return []
+        data = self._get_json(self._url("/api/org"), stage="organizations", target="/api/org")
+        orgs = []
+        for org in data.get("org", []) or []:
+            orgs.append({
+                "name": org.get("name"),
+                "href": org.get("href")
+            })
+        return sorted(orgs, key=lambda x: x.get("name") or "")
 
     def switch_to_org(self, org_name: str) -> bool:
-        """Switch context to a specific organization."""
+        """Record the selected organization. Scoping is done by catalog identity in the scan."""
         self.current_org = org_name
         return True
 
+    @staticmethod
+    def _catalog_entry(record: dict, shared: Optional[bool] = None) -> dict:
+        href = record.get("href", "")
+        return {
+            "name": record.get("name"),
+            "href": href,
+            "id": record.get("id") or href,
+            "org": record.get("org", "") if _looks_like_ref(record.get("org", "")) else "",
+            "orgName": record.get("orgName", record.get("org", "N/A")),
+            "isShared": True if shared else record.get("isShared", False),
+            "isPublished": True if shared else record.get("isPublished", False),
+        }
+
     def get_catalogs(self, org_name: Optional[str] = None) -> List[dict]:
         """
-        Get list of catalogs visible to the authenticated user.
-        
+        Get list of catalogs visible to the authenticated user, with their identity
+        (href/id, owning org href and name).
+
         Args:
             org_name: Optional organization name to filter catalogs by.
                       If provided, only returns catalogs belonging to or shared with that org.
+
+        Raises VCDQueryError on failure (a 403 on adminCatalog falls back to catalog).
         """
         catalogs = []
-        
-        # Build filter based on org if provided
-        org_filter = ""
-        if org_name and org_name.lower() != "system":
-            # Filter by org name - this will get catalogs owned by this org
-            org_filter = f"&filter=orgName=={org_name}"
-        
-        # Try adminCatalog first (for provider/system admin access)
-        query_types = ["adminCatalog", "catalog"]
-        
-        for query_type in query_types:
+        scoped = bool(org_name) and org_name.lower() != "system"
+        filters = [("orgName", org_name)] if scoped else []
+
+        last_403 = None
+        any_succeeded = False
+        for query_type in ("adminCatalog", "catalog"):
             try:
-                page = 1
-                page_size = 100
-                total_fetched = 0
-                
-                while True:
-                    uri = f"https://{self.host}/api/query?type={query_type}&format=records&page={page}&pageSize={page_size}{org_filter}"
-                    response = self.session.get(uri, headers=self._get_headers())
-                    
-                    if response.status_code == 403:
-                        # Not authorized for this query type, try next
-                        break
-                    
-                    response.raise_for_status()
-                    data = response.json()
-                    
-                    records = data.get("record", [])
-                    if not records:
-                        break
-                    
-                    for record in records:
-                        catalog_entry = {
-                            "name": record.get("name"),
-                            "href": record.get("href"),
-                            "orgName": record.get("orgName", record.get("org", "N/A")),
-                            "isShared": record.get("isShared", False),
-                            "isPublished": record.get("isPublished", False),
-                        }
-                        # Avoid duplicates
-                        if not any(c["name"] == catalog_entry["name"] and c["orgName"] == catalog_entry["orgName"] for c in catalogs):
-                            catalogs.append(catalog_entry)
-                    
-                    total_fetched += len(records)
-                    
-                    # Check if there are more pages
-                    total_records = int(data.get("total", 0))
-                    if total_fetched >= total_records or len(records) < page_size:
-                        break
-                    
-                    page += 1
-                
-                # If we got catalogs with adminCatalog, no need to try catalog
-                if catalogs:
-                    break
-                    
-            except requests.exceptions.HTTPError as e:
-                print(f"Query type {query_type} failed: {e}")
-                continue
-            except Exception as e:
-                print(f"Error fetching catalogs with {query_type}: {e}")
-                continue
-        
+                records = self._query_records(query_type, stage="catalogs",
+                                              target=f"{query_type} query", filters=filters)
+            except VCDQueryError as e:
+                if e.status == 403:
+                    last_403 = e
+                    continue
+                raise
+            any_succeeded = True
+            for record in records:
+                if scoped and record.get("orgName") and record.get("orgName").lower() != org_name.lower():
+                    continue
+                entry = self._catalog_entry(record)
+                if not any(
+                    (entry["href"] and c["href"] == entry["href"])
+                    or (c["name"] == entry["name"] and c["orgName"] == entry["orgName"])
+                    for c in catalogs
+                ):
+                    catalogs.append(entry)
+            if catalogs:
+                break
+        if not any_succeeded and last_403 is not None:
+            raise last_403
+
         # If org filter was applied but we also need shared catalogs, fetch those too
-        if org_name and org_name.lower() != "system":
+        if scoped:
             shared_catalogs = self._get_shared_catalogs_for_org(org_name)
             for cat in shared_catalogs:
                 if not any(c["name"] == cat["name"] for c in catalogs):
                     catalogs.append(cat)
-        
+
         print(f"Found {len(catalogs)} catalogs for org '{org_name or 'all'}'")
-        return sorted(catalogs, key=lambda x: (x.get("orgName", ""), x.get("name", "")))
+        return sorted(catalogs, key=lambda x: (x.get("orgName") or "", x.get("name") or ""))
 
     def _get_shared_catalogs_for_org(self, org_name: str) -> List[dict]:
-        """Get catalogs that are shared/published and accessible to the specified org."""
-        catalogs = []
-        page = 1
-        page_size = 100
+        """Get catalogs that are shared/published and accessible to the specified org.
 
+        A 403 (no rights to the admin query) returns []; other errors raise.
+        """
         try:
-            while True:
-                uri = f"https://{self.host}/api/query?type=adminCatalog&format=records&filter=isPublished==true&page={page}&pageSize={page_size}"
-                response = self.session.get(uri, headers=self._get_headers())
-                if response.status_code != 200:
-                    break
-
-                data = response.json()
-                records = data.get("record", [])
-
-                if not records:
-                    break
-
-                for record in records:
-                    catalogs.append({
-                        "name": record.get("name"),
-                        "href": record.get("href"),
-                        "orgName": record.get("orgName", "N/A"),
-                        "isShared": True,
-                        "isPublished": True,
-                    })
-
-                total_records = int(data.get("total", 0))
-                if len(catalogs) >= total_records or len(records) < page_size:
-                    break
-
-                page += 1
-
-        except Exception as e:
-            print(f"Error fetching shared catalogs: {e}")
-        return catalogs
+            records = self._query_records("adminCatalog", stage="catalogs",
+                                          target="published catalogs",
+                                          filters=[("isPublished", "true")])
+        except VCDQueryError as e:
+            if e.status == 403:
+                return []
+            raise
+        return [self._catalog_entry(r, shared=True) for r in records]
 
     def get_datastores(self) -> List[dict]:
-        """Get list of datastores (requires provider-level access)."""
+        """Get list of datastores with their identity (href, vCenter). Requires provider access."""
+        records = self._query_records("datastore", stage="datastores", target="datastore query")
         datastores = []
-        page = 1
-        page_size = 100
+        for record in records:
+            href = record.get("href", "")
+            datastores.append({
+                "name": record.get("name"),
+                "href": href,
+                "id": record.get("id") or href,
+                "vc": record.get("vc", ""),
+                "vcName": record.get("vcName", ""),
+                "datastoreType": record.get("datastoreType", "")
+            })
+        return sorted(datastores, key=lambda x: x.get("name") or "")
 
-        try:
-            while True:
-                uri = f"https://{self.host}/api/query?type=datastore&format=records&page={page}&pageSize={page_size}"
-                response = self.session.get(uri, headers=self._get_headers())
-                response.raise_for_status()
+    def get_vapp_templates_in_catalog(self, catalog, warnings: Optional[List[str]] = None) -> List[VAppTemplate]:
+        """Get all vApp templates in a catalog.
 
-                data = response.json()
-                records = data.get("record", [])
-
-                if not records:
-                    break
-
-                for record in records:
-                    datastores.append({
-                        "name": record.get("name"),
-                        "href": record.get("href"),
-                        "vcName": record.get("vcName", ""),
-                        "datastoreType": record.get("datastoreType", "")
-                    })
-
-                total_records = int(data.get("total", 0))
-                if len(datastores) >= total_records or len(records) < page_size:
-                    break
-
-                page += 1
-
-            return sorted(datastores, key=lambda x: x.get("name", ""))
-        except Exception as e:
-            print(f"Failed to get datastores: {e}")
-            return []
-
-    def get_vapp_templates_in_catalog(self, catalog_name: str) -> List[VAppTemplate]:
-        """Get all vApp templates in a specific catalog."""
+        catalog: a catalog name, or a catalog dict from get_catalogs() (name, href, org,
+        orgName). With a dict, template records are kept only if their catalog/org
+        reference matches; records without those fields are kept and a warning is added.
+        Raises VCDQueryError on failure.
+        """
+        ident = catalog if isinstance(catalog, dict) else {"name": catalog}
+        name = ident.get("name") or ""
+        records = self._query_records("adminVAppTemplate", stage="templates",
+                                      target=f"catalog '{name}'", filters=[("catalogName", name)])
+        has_identity = any(ident.get(k) for k in ("href", "org")) or (
+            ident.get("orgName") not in (None, "", "N/A"))
         templates = []
-        page = 1
-        page_size = 100
+        unscoped = 0
+        for record in records:
+            if "catalogName" in record and record.get("catalogName") != name:
+                continue
+            verdict = _scope_check(record, ident, (("catalog", "href"), ("org", "org"),
+                                                   ("orgName", "orgName")))
+            if verdict is False:
+                continue
+            if verdict is None:
+                unscoped += 1
+            org_name = record.get("orgName") or ""
+            if not org_name and ident.get("orgName") not in (None, "N/A") \
+                    and not _looks_like_ref(ident.get("orgName")):
+                org_name = ident.get("orgName") or ""
+            templates.append(VAppTemplate(
+                name=record.get("name", "") or "",
+                href=record.get("href", "") or "",
+                id=record.get("id", "") or record.get("href", "") or "",
+                catalog_name=record.get("catalogName", "") or name,
+                org_href=record.get("org", "") or "",
+                org_name=org_name,
+                catalog_href=record.get("catalog", "") or ident.get("href", "") or "",
+            ))
+        if warnings is not None:
+            if not has_identity:
+                warnings.append(f"catalog '{name}' was given by name only; its templates are not "
+                                f"scoped to one org")
+            elif unscoped:
+                warnings.append(f"catalog '{name}': {unscoped} template record(s) carry no catalog/org "
+                                f"reference, so they could not be scoped to this catalog's org; kept")
+        return templates
 
-        try:
-            while True:
-                uri = f"https://{self.host}/api/query?type=adminVAppTemplate&format=records&filter=catalogName=={catalog_name}&page={page}&pageSize={page_size}"
-                response = self.session.get(uri, headers=self._get_headers())
-                response.raise_for_status()
+    @staticmethod
+    def _shadow_from_record(record: dict) -> ShadowVM:
+        name = record.get("name", "") or ""
+        # Parent template NAME: a record field (never an href), else the first word of the name.
+        field_name = ""
+        for key in ("containerName", "container", "vappTemplate", "catalogItem"):
+            val = record.get(key)
+            if val and isinstance(val, str) and not _looks_like_ref(val):
+                field_name = val
+                break
+        container_name = field_name or (name.split(" ")[0] if " " in name else "")
 
-                data = response.json()
-                records = data.get("record", [])
+        # Authoritative parent reference: primaryVAppTemplate / vAppTemplate, or a
+        # container/entity reference that points at a vAppTemplate.
+        parent_ref = ""
+        for key in ("primaryVAppTemplate", "vAppTemplate"):
+            val = record.get(key)
+            if val and isinstance(val, str):
+                parent_ref = val
+                break
+        container_id = parent_ref
+        if not parent_ref:
+            for key in ("container", "entity"):
+                val = record.get(key)
+                if val and _looks_like_ref(val):
+                    container_id = container_id or val
+                    if "vapptemplate" in val.lower():
+                        parent_ref = val
+                        container_id = val
+                        break
+        href = record.get("href", "") or ""
+        return ShadowVM(
+            name=name,
+            href=href,
+            container_name=container_name,
+            container_id=container_id,
+            datastore_name=record.get("datastoreName", "") or "",
+            vm_id=href.split("/")[-1] if href else "",
+            primary_vm_href=record.get("primaryVM", "") or "",
+            parent_ref=parent_ref,
+            container_name_from_field=bool(field_name),
+            datastore_href=record.get("datastore", "") or "",
+            vc_name=record.get("vcName", "") or "",
+        )
 
-                if not records:
-                    break
+    def get_shadow_vms_on_datastore(self, datastore, debug: bool = False,
+                                    warnings: Optional[List[str]] = None) -> List[ShadowVM]:
+        """Get all Shadow VMs on a datastore.
 
-                for record in records:
-                    templates.append(VAppTemplate(
-                        name=record.get("name", ""),
-                        href=record.get("href", ""),
-                        id=record.get("id", "") or record.get("href", ""),
-                        catalog_name=record.get("catalogName", "")
-                    ))
-
-                total_records = int(data.get("total", 0))
-                if len(templates) >= total_records or len(records) < page_size:
-                    break
-
-                page += 1
-
-            return templates
-        except Exception as e:
-            print(f"Failed to get vApp templates: {e}")
-            return []
-
-    def get_shadow_vms_on_datastore(self, datastore_name: str, debug: bool = False) -> List[ShadowVM]:
-        """Get all Shadow VMs on a specific datastore."""
+        datastore: a datastore name, or a datastore dict from get_datastores() (name,
+        href, vc, vcName). With a dict, records are kept only if their datastore/vCenter
+        reference matches; records without those fields are kept and a warning is added.
+        Raises VCDQueryError on failure.
+        """
+        ident = datastore if isinstance(datastore, dict) else {"name": datastore}
+        name = ident.get("name") or ""
+        records = self._query_records("adminShadowVM", stage="shadow VMs",
+                                      target=f"datastore '{name}'", filters=[("datastoreName", name)])
+        if debug and records:
+            print(f"DEBUG: Sample Shadow VM record fields: {list(records[0].keys())}")
+            print(f"DEBUG: Sample Shadow VM record: {records[0]}")
+        has_identity = any(ident.get(k) for k in ("href", "vc", "vcName"))
         shadows = []
-        page = 1
-        page_size = 100
-        
-        try:
-            while True:
-                uri = f"https://{self.host}/api/query?type=adminShadowVM&format=records&filter=datastoreName=={datastore_name}&page={page}&pageSize={page_size}"
-                response = self.session.get(uri, headers=self._get_headers())
-                response.raise_for_status()
-                
-                data = response.json()
-                records = data.get("record", [])
-                
-                if not records:
-                    break
-                
-                # Debug: print first record to see available fields
-                if debug and page == 1 and records:
-                    print(f"DEBUG: Sample Shadow VM record fields: {list(records[0].keys())}")
-                    print(f"DEBUG: Sample Shadow VM record: {records[0]}")
-                
-                for record in records:
-                    # The container/parent template reference might be in different fields
-                    # Check multiple possible field names for NAME
-                    container_name = (
-                        record.get("containerName") or 
-                        record.get("container") or 
-                        record.get("vappTemplate") or
-                        record.get("catalogItem") or
-                        record.get("name", "").split(" ")[0] if " " in record.get("name", "") else ""
-                    )
-                    
-                    # Capture the container/parent reference ID/HREF
-                    # Based on debug output, primaryVAppTemplate is the key field
-                    container_id = (
-                        record.get("primaryVAppTemplate") or 
-                        record.get("container") or 
-                        record.get("vAppTemplate") or 
-                        record.get("entity") or
-                        ""
-                    )
-                    
-                    # Also capture the primary template reference if available
-                    primary_vm_name = record.get("primaryVmName", "")
-                    primary_vm_href = record.get("primaryVM", "")
-                    
-                    shadows.append(ShadowVM(
-                        name=record.get("name", ""),
-                        href=record.get("href", ""),
-                        container_name=container_name,
-                        container_id=container_id,
-                        datastore_name=record.get("datastoreName", ""),
-                        vm_id=record.get("href", "").split("/")[-1] if record.get("href") else "",
-                        primary_vm_href=primary_vm_href
-                    ))
-                
-                # Check pagination
-                total_records = int(data.get("total", 0))
-                if len(shadows) >= total_records or len(records) < page_size:
-                    break
-                page += 1
-                
-            return shadows
-        except Exception as e:
-            print(f"Failed to get Shadow VMs: {e}")
-            return []
+        unscoped = 0
+        for record in records:
+            if "datastoreName" in record and record.get("datastoreName") != name:
+                continue
+            if has_identity:
+                verdict = _scope_check(record, ident, (("datastore", "href"), ("vc", "vc"),
+                                                       ("vcName", "vcName")))
+                if verdict is False:
+                    continue
+                if verdict is None:
+                    unscoped += 1
+            shadow = self._shadow_from_record(record)
+            if not shadow.datastore_href:
+                shadow.datastore_href = ident.get("href", "") or ""
+            if not shadow.vc_name:
+                shadow.vc_name = ident.get("vcName", "") or ""
+            shadows.append(shadow)
+        if warnings is not None and unscoped:
+            warnings.append(f"datastore '{name}': {unscoped} shadow VM record(s) carry no datastore/"
+                            f"vCenter reference, so they could not be scoped to one vCenter; kept")
+        return shadows
 
-    def delete_shadow_vm(self, shadow_vm: ShadowVM) -> Tuple[bool, str]:
-        """
-        Delete a Shadow VM.
-        
-        Returns:
-            Tuple of (success: bool, message: str)
-        """
+    # ---- delete ----
+
+    def _task_href_from_response(self, resp) -> str:
+        headers = getattr(resp, "headers", None) or {}
+        location = headers.get("Location") or headers.get("location")
+        if location:
+            return urljoin(self._url("/"), location)
         try:
-            response = self.session.delete(shadow_vm.href, headers=self._get_headers())
-            
-            if response.status_code in [200, 202, 204]:
-                return True, f"Successfully deleted {shadow_vm.name}"
-            else:
-                return False, f"Failed to delete {shadow_vm.name}: {response.status_code}"
-        except Exception as e:
-            return False, f"Error deleting {shadow_vm.name}: {e}"
+            body = resp.json()
+        except Exception:
+            body = None
+        if isinstance(body, dict):
+            for cand in (body, body.get("task") if isinstance(body.get("task"), dict) else None):
+                if not cand:
+                    continue
+                href = cand.get("href") or ""
+                ctype = str(cand.get("type") or "").lower()
+                if href and ("/task/" in href.lower() or "task" in ctype):
+                    return href
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        m = re.search(r"<(?:\w+:)?Task\b[^>]*\shref=\"([^\"]+)\"", str(text))
+        return m.group(1) if m else ""
+
+    def _wait_for_task(self, shadow: ShadowVM, task_href: str, http_status: int) -> DeleteResult:
+        deadline = _monotonic() + TASK_TIMEOUT_SECONDS
+        last = ""
+        while True:
+            try:
+                data = self._get_json(task_href, stage="task", target=f"delete task for {shadow.name}")
+            except VCDQueryError as e:
+                return DeleteResult(shadow, "accepted_unverified",
+                                    f"delete accepted (HTTP {http_status}) but the task could not be "
+                                    f"read: {e}", http_status=e.status if e.status in (401, 403) else http_status,
+                                    task_href=task_href, task_status=last)
+            last = str(data.get("status", "")).strip()
+            _logger.debug("task %s status=%r", task_href, last)
+            low = last.lower()
+            if low == "success":
+                return DeleteResult(shadow, "deleted", f"Deleted {shadow.name} (task succeeded)",
+                                    http_status=http_status, task_href=task_href, task_status=last)
+            if low in _TASK_FAILED_STATES:
+                err = data.get("error") if isinstance(data.get("error"), dict) else {}
+                detail = err.get("message") or data.get("details") or ""
+                return DeleteResult(shadow, "failed",
+                                    f"Delete task for {shadow.name} ended '{last}'" + (f": {detail}" if detail else ""),
+                                    http_status=http_status, task_href=task_href, task_status=last)
+            if _monotonic() >= deadline:
+                return DeleteResult(shadow, "timeout",
+                                    f"Delete task for {shadow.name} still '{last}' after "
+                                    f"{int(TASK_TIMEOUT_SECONDS)} s",
+                                    http_status=http_status, task_href=task_href, task_status=last)
+            _sleep(TASK_POLL_INTERVAL_SECONDS)
+
+    def delete_shadow_vm(self, shadow_vm: ShadowVM) -> DeleteResult:
+        """Delete a Shadow VM and report the real outcome.
+
+        A returned Task (Location header, or a task href in the body) is polled until it
+        finishes or TASK_TIMEOUT_SECONDS passes. 204 counts as deleted. 200/202 without a
+        task reference is reported as accepted_unverified.
+        """
+        if not shadow_vm.href:
+            return DeleteResult(shadow_vm, "failed", f"Cannot delete {shadow_vm.name}: no href")
+        try:
+            resp = self._request("DELETE", shadow_vm.href, stage="delete", target=shadow_vm.name,
+                                 retry=False)
+        except VCDQueryError as e:
+            return DeleteResult(shadow_vm, "failed", f"Error deleting {shadow_vm.name}: {e}")
+        headers = getattr(resp, "headers", None) or {}
+        _logger.debug("DELETE %s -> HTTP %s Location=%r Content-Type=%r body=%r",
+                      shadow_vm.href, resp.status_code, headers.get("Location"),
+                      headers.get("Content-Type"), self._body_snippet(resp, 500))
+        status = resp.status_code
+        if status >= 400:
+            snippet = self._body_snippet(resp)
+            return DeleteResult(shadow_vm, "failed",
+                                f"Failed to delete {shadow_vm.name}: HTTP {status}" + (f": {snippet}" if snippet else ""),
+                                http_status=status)
+        task_href = self._task_href_from_response(resp)
+        if task_href:
+            return self._wait_for_task(shadow_vm, task_href, status)
+        if status == 204:
+            return DeleteResult(shadow_vm, "deleted", f"Deleted {shadow_vm.name}", http_status=status)
+        return DeleteResult(shadow_vm, "accepted_unverified",
+                            f"Delete of {shadow_vm.name} accepted (HTTP {status}), not verified: "
+                            f"no task returned", http_status=status)
 
     def disconnect(self):
-        """Disconnect from VCD."""
+        """Disconnect from VCD (best effort; a failed logout is not an error)."""
         try:
             if self.access_token:
-                uri = f"https://{self.host}/api/session"
-                self.session.delete(uri, headers=self._get_headers())
-        except:
+                self.session.request("DELETE", self._url("/api/session"), headers=self._get_headers(),
+                                     timeout=HTTP_TIMEOUT)
+        except Exception:
             pass
         finally:
             self.access_token = None
             self.current_org = None
 
 
-def scan_shadow_vms(client: VCDClient, catalog_names: List[str], datastore_names,
-                    vcd_server: str = "", org_name: str = "", debug: bool = True) -> List[ShadowVM]:
+def delete_shadow_vms(client: VCDClient, shadows: List[ShadowVM], *,
+                      delay_seconds: float = DELETE_DELAY_SECONDS,
+                      max_consecutive_failures: int = MAX_CONSECUTIVE_DELETE_FAILURES,
+                      on_start: Optional[Callable[[int, ShadowVM], None]] = None,
+                      on_result: Optional[Callable[[DeleteResult], None]] = None) -> DeleteRun:
+    """Delete shadow VMs one by one (shared by the CLI and the GUI).
+
+    Pauses delay_seconds between deletes, stops after max_consecutive_failures failures
+    in a row or on any 401/403; the remaining items are reported as skipped.
+    """
+    run = DeleteRun()
+    consecutive = 0
+    attempted = 0
+    for shadow in shadows:
+        if run.stopped_reason:
+            result = DeleteResult(shadow, "skipped", f"Not attempted: {run.stopped_reason}")
+            run.results.append(result)
+            if on_result:
+                on_result(result)
+            continue
+        if attempted:
+            _sleep(delay_seconds)
+        if on_start:
+            on_start(attempted, shadow)
+        attempted += 1
+        result = client.delete_shadow_vm(shadow)
+        run.results.append(result)
+        if on_result:
+            on_result(result)
+        if result.http_status in (401, 403):
+            run.stopped_reason = (f"stopped after HTTP {result.http_status} (not authorized); "
+                                  f"remaining deletes skipped")
+        elif result.ok:
+            consecutive = 0
+        else:
+            consecutive += 1
+            if consecutive >= max_consecutive_failures:
+                run.stopped_reason = (f"stopped after {consecutive} consecutive failures; "
+                                      f"remaining deletes skipped")
+    return run
+
+
+def _match_templates(shadow: ShadowVM, ordered: List[VAppTemplate]):
+    """Return (strength, rule, winner, others) for name/substring matching, or None.
+
+    ordered: templates sorted longest name first (ties by name, then catalog order),
+    empty names already removed. Matches only on token boundaries.
+    """
+    def boundary_pos(text: str, sub: str) -> int:
+        i = text.find(sub)
+        while i != -1:
+            end = i + len(sub)
+            if (i == 0 or text[i - 1] in _NAME_BOUNDARY) and (end == len(text) or text[end] in _NAME_BOUNDARY):
+                return i
+            i = text.find(sub, i + 1)
+        return -1
+
+    if shadow.container_name_from_field and shadow.container_name:
+        hits = [t for t in ordered if t.name == shadow.container_name]
+        if hits:
+            others = hits[1:] + [t for t in ordered
+                                 if all(t is not h for h in hits) and boundary_pos(shadow.name, t.name) >= 0]
+            return MATCH_NAME, "container_name", hits[0], others
+
+    prefix, inner = [], []
+    for t in ordered:
+        pos = boundary_pos(shadow.name, t.name)
+        if pos == 0:
+            prefix.append(t)
+        elif pos > 0:
+            inner.append(t)
+    if prefix:
+        return MATCH_NAME, "name_prefix", prefix[0], prefix[1:] + inner
+    if inner:
+        return MATCH_SUBSTRING, "name_token", inner[0], inner[1:]
+    return None
+
+
+def scan_shadow_vms(client: VCDClient, catalogs, datastores, vcd_server: str = "",
+                    debug: bool = False) -> ScanResult:
     """
     Scan for Shadow VMs on one or more datastores that belong to templates in one or more catalogs.
 
     Args:
         client: Authenticated VCDClient
-        catalog_names: List of catalog names (or a single name) to scan
-        datastore_names: List of datastore names (or a single name) to scan for shadow VMs
+        catalogs: catalog names or catalog dicts from get_catalogs() (a single item is accepted)
+        datastores: datastore names or datastore dicts from get_datastores()
         vcd_server: VCD server hostname to stamp on results (for multi-VCD consolidation)
-        org_name: Org/tenant name to stamp on results
         debug: Enable debug output
 
-    Returns:
-        List of matching shadow VMs with catalog_name, vcd_server, org_name populated
+    Matching, in priority order:
+      1. exact: the shadow's parent reference is one of the selected templates.
+         A parent reference that points at any other template makes the shadow
+         'other_template': it is never matched by name.
+      2. name: the record's container name equals a template name, or the shadow's
+         name starts with a template name at a token boundary.
+      3. substring: a template name appears inside the shadow's name on token
+         boundaries (-, _, space, dot, parentheses).
+    Longest template name wins; other fitting templates are recorded in ambiguous_with.
+    Query failures are collected in result.errors (result.complete is then False).
     """
-    if isinstance(catalog_names, str):
-        catalog_names = [catalog_names]
-    if isinstance(datastore_names, str):
-        datastore_names = [datastore_names]
+    if isinstance(catalogs, (str, dict)):
+        catalogs = [catalogs]
+    if isinstance(datastores, (str, dict)):
+        datastores = [datastores]
+    cat_idents = [c if isinstance(c, dict) else {"name": c} for c in catalogs]
+    ds_idents = [d if isinstance(d, dict) else {"name": d} for d in datastores]
+
+    result = ScanResult()
+
+    def record_error(e: VCDError):
+        err = e.to_dict()
+        err["server"] = vcd_server
+        result.errors.append(err)
+        print(f"  ERROR: {e}")
 
     print(f"\nScanning for Shadow VMs...")
-    print(f"  Catalogs: {', '.join(catalog_names)}")
-    print(f"  Datastores: {', '.join(datastore_names)}")
+    print(f"  Catalogs: {', '.join(str(c.get('name')) for c in cat_idents)}")
+    print(f"  Datastores: {', '.join(str(d.get('name')) for d in ds_idents)}")
 
-    # Build combined lookup structures across all catalogs
-    # Maps template HREF/ID -> (template_name, catalog_name)
-    template_ids: dict[str, tuple[str, str]] = {}
-    # Maps template name -> catalog_name (first catalog wins for name-based matching)
-    template_name_to_catalog: dict[str, str] = {}
-
-    for cat_name in catalog_names:
-        templates = client.get_vapp_templates_in_catalog(cat_name)
+    # Collect templates across catalogs (deduplicated by href, catalog order kept)
+    all_templates: List[VAppTemplate] = []
+    seen_tpl = set()
+    for ident in cat_idents:
+        cat_name = ident.get("name") or ""
+        try:
+            templates = client.get_vapp_templates_in_catalog(ident, warnings=result.warnings)
+        except VCDError as e:
+            record_error(e)
+            continue
         print(f"  Found {len(templates)} templates in catalog '{cat_name}'")
         if debug and templates:
             print(f"  DEBUG: Sample template names ({cat_name}): {[t.name for t in templates[:5]]}")
-
         for t in templates:
-            if t.href:
-                template_ids[t.href] = (t.name, cat_name)
-            if t.id:
-                template_ids[t.id] = (t.name, cat_name)
-            if t.name not in template_name_to_catalog:
-                template_name_to_catalog[t.name] = cat_name
+            key = _ref_key(t.href) if t.href else ("name", t.name, cat_name)
+            if key in seen_tpl:
+                continue
+            seen_tpl.add(key)
+            if not t.catalog_name:
+                t.catalog_name = cat_name
+            all_templates.append(t)
 
-    template_names = set(template_name_to_catalog.keys())
+    template_by_ref: dict = {}
+    for t in all_templates:
+        for ref in (t.href, t.id):
+            if ref:
+                template_by_ref.setdefault(ref, t)
+                template_by_ref.setdefault(_ref_key(ref), t)
+    order = {id(t): i for i, t in enumerate(all_templates)}
+    named = [t for t in all_templates if t.name and t.name.strip()]
+    skipped_empty = len(all_templates) - len(named)
+    if skipped_empty:
+        result.warnings.append(f"{skipped_empty} template(s) with an empty name ignored for name matching")
+    ordered = sorted(named, key=lambda t: (-len(t.name), t.name, order[id(t)]))
 
-    all_shadows = []
-    for ds_name in datastore_names:
-        ds_shadows = client.get_shadow_vms_on_datastore(ds_name, debug=debug)
+    all_shadows: List[ShadowVM] = []
+    for ident in ds_idents:
+        ds_name = ident.get("name") or ""
+        try:
+            ds_shadows = client.get_shadow_vms_on_datastore(ident, debug=debug, warnings=result.warnings)
+        except VCDError as e:
+            record_error(e)
+            continue
         print(f"  Found {len(ds_shadows)} Shadow VMs on datastore '{ds_name}'")
         all_shadows.extend(ds_shadows)
-    print(f"  Found {len(all_shadows)} Shadow VMs across {len(datastore_names)} datastore(s)")
+    print(f"  Found {len(all_shadows)} Shadow VMs across {len(ds_idents)} datastore(s)")
 
     if debug and all_shadows:
         print(f"  DEBUG: Sample Shadow VM container_names: {[s.container_name for s in all_shadows[:5]]}")
         print(f"  DEBUG: Sample Shadow VM container_ids: {[s.container_id for s in all_shadows[:5]]}")
         print(f"  DEBUG: Sample Shadow VM names: {[s.name for s in all_shadows[:5]]}")
 
-    matching_shadows = []
+    def amb(ts):
+        return [{"template": t.name, "catalog": t.catalog_name, "href": t.href} for t in ts]
 
-    for shadow in all_shadows:
-        # Strategy 1: Direct container_id match (HREF/ID)
-        if shadow.container_id and shadow.container_id in template_ids:
-            tpl_name, cat_name = template_ids[shadow.container_id]
-            shadow.container_name = tpl_name
-            shadow.catalog_name = cat_name
-            matching_shadows.append(shadow)
-            continue
-
-        # Strategy 2: Direct container_name match
-        if shadow.container_name in template_names:
-            shadow.catalog_name = template_name_to_catalog[shadow.container_name]
-            matching_shadows.append(shadow)
-            continue
-
-        # Strategy 3: Check if shadow VM name contains any template name
-        for tpl_name in template_names:
-            if shadow.name.startswith(tpl_name) or tpl_name in shadow.name:
-                shadow.container_name = tpl_name
-                shadow.catalog_name = template_name_to_catalog[tpl_name]
-                matching_shadows.append(shadow)
-                break
-
-    # Stamp server/org on every matched shadow
-    for s in matching_shadows:
-        s.vcd_server = vcd_server
-        s.org_name = org_name
-
-    # Deduplicate by href
     seen_hrefs = set()
-    unique_shadows = []
-    for s in matching_shadows:
-        if s.href not in seen_hrefs:
-            seen_hrefs.add(s.href)
-            unique_shadows.append(s)
+    for shadow in all_shadows:
+        dedup_key = shadow.href or id(shadow)
+        if dedup_key in seen_hrefs:
+            continue
+        seen_hrefs.add(dedup_key)
 
-    print(f"  Matched {len(unique_shadows)} Shadow VMs to catalog templates")
+        tpl = None
+        for ref in (shadow.parent_ref, shadow.container_id):
+            if ref:
+                tpl = template_by_ref.get(ref) or template_by_ref.get(_ref_key(ref))
+                if tpl:
+                    break
+        if tpl is not None:
+            shadow.match_strength, shadow.match_rule = MATCH_EXACT, "parent_ref"
+        elif shadow.parent_ref:
+            result.other_template += 1
+            continue
+        else:
+            hit = _match_templates(shadow, ordered)
+            if hit is None:
+                result.unmatched += 1
+                continue
+            shadow.match_strength, shadow.match_rule, tpl, others = hit
+            shadow.ambiguous_with = amb(others)
 
-    return unique_shadows
+        shadow.container_name = tpl.name
+        shadow.catalog_name = tpl.catalog_name
+        shadow.template_href = tpl.href
+        shadow.org_name = tpl.org_name
+        shadow.vcd_server = vcd_server
+        result.shadows.append(shadow)
+
+    c = result.counts
+    print(f"  Matched {len(result.shadows)} Shadow VMs to catalog templates "
+          f"({c['exact']} exact, {c['weak']} weak); {c['other_template']} belong to other templates, "
+          f"{c['unmatched']} unmatched")
+    if not result.complete:
+        print(f"  Scan INCOMPLETE: {len(result.errors)} error(s)")
+    return result
+
+
+def scan_sessions(sessions: list) -> ScanResult:
+    """Scan several VCD sessions in parallel (GUI multi-VCD scan).
+
+    Each session dict has 'client', 'server', 'catalogs' and 'datastores'. One session's
+    failure is recorded in errors and never discards the other sessions' results.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    combined = ScanResult()
+
+    def scan_one(session):
+        return scan_shadow_vms(session["client"], session["catalogs"], session["datastores"],
+                               vcd_server=session["server"], debug=False)
+
+    with ThreadPoolExecutor(max_workers=max(1, len(sessions))) as executor:
+        futures = [(s, executor.submit(scan_one, s)) for s in sessions]
+        for session, future in futures:
+            try:
+                combined.extend(future.result())
+            except Exception as e:
+                combined.errors.append({
+                    "type": type(e).__name__, "stage": getattr(e, "stage", "scan") or "scan",
+                    "target": getattr(e, "target", "") or "", "http_status": getattr(e, "status", None),
+                    "message": str(e), "server": session.get("server", ""),
+                })
+    return combined
 
 
 def print_shadow_vm_table(shadows: List[ShadowVM]):
@@ -792,33 +1311,109 @@ def print_shadow_vm_table(shadows: List[ShadowVM]):
         print("\nNo Shadow VMs found matching the criteria.")
         return
 
-    # Calculate column widths
-    name_width = max(len(s.name) for s in shadows)
-    name_width = max(name_width, len("Shadow VM Name"))
+    def match_label(s: ShadowVM) -> str:
+        return (s.match_strength or "?") + (" (ambiguous)" if s.ambiguous_with else "")
 
-    template_width = max(len(s.container_name) for s in shadows)
-    template_width = max(template_width, len("Parent Template"))
+    cols = [
+        ("Shadow VM Name", lambda s: s.name),
+        ("Parent Template", lambda s: s.container_name),
+        ("Match", match_label),
+        ("Catalog", lambda s: s.catalog_name),
+        ("Org", lambda s: s.org_name),
+        ("Datastore", lambda s: s.datastore_name),
+    ]
+    widths = [max(len(title), max(len(str(fn(s) or "")) for s in shadows)) for title, fn in cols]
+    total_width = sum(widths) + 3 * len(cols) + 1
 
-    cat_width = max(len(s.catalog_name) for s in shadows)
-    cat_width = max(cat_width, len("Catalog"))
-
-    ds_width = max(len(s.datastore_name) for s in shadows)
-    ds_width = max(ds_width, len("Datastore"))
-
-    total_width = name_width + template_width + cat_width + ds_width + 13
-
-    # Print header
     print("\n" + "=" * total_width)
-    print(f"| {'Shadow VM Name':<{name_width}} | {'Parent Template':<{template_width}} | {'Catalog':<{cat_width}} | {'Datastore':<{ds_width}} |")
-    print("|" + "-" * (name_width + 2) + "|" + "-" * (template_width + 2) + "|" + "-" * (cat_width + 2) + "|" + "-" * (ds_width + 2) + "|")
-
-    # Print rows
+    print("| " + " | ".join(f"{title:<{w}}" for (title, _), w in zip(cols, widths)) + " |")
+    print("|" + "|".join("-" * (w + 2) for w in widths) + "|")
     for shadow in shadows:
-        print(f"| {shadow.name:<{name_width}} | {shadow.container_name:<{template_width}} | {shadow.catalog_name:<{cat_width}} | {shadow.datastore_name:<{ds_width}} |")
-
-    # Print footer
+        print("| " + " | ".join(f"{str(fn(shadow) or ''):<{w}}" for (_, fn), w in zip(cols, widths)) + " |")
     print("=" * total_width)
     print(f"\nTotal Shadow VMs: {len(shadows)}")
+
+
+def _open_tty():
+    """Open the controlling terminal as (reader, writer); None when there is none.
+
+    The delete confirmation is read here, never from stdin, so piping 'yes' into the
+    tool cannot confirm a delete.
+    """
+    try:
+        if os.name == "nt":
+            reader = open("CONIN$", "r")
+            writer = open("CONOUT$", "w")
+        else:
+            reader = open("/dev/tty", "r")
+            writer = open("/dev/tty", "w")
+    except OSError:
+        return None
+    return reader, writer
+
+
+def _confirm_on_terminal(prompt: str, expected: str = "yes") -> Optional[bool]:
+    """Ask on the controlling terminal. None = no terminal; True/False = answer."""
+    tty = _open_tty()
+    if tty is None:
+        return None
+    reader, writer = tty
+    try:
+        writer.write(prompt)
+        writer.flush()
+        answer = reader.readline()
+    except (OSError, EOFError):
+        answer = ""
+    finally:
+        for f in (reader, writer):
+            with contextlib.suppress(Exception):
+                f.close()
+    return answer.strip().lower() == expected
+
+
+def _resolve_scope(client: VCDClient, catalog_names: List[str], datastore_names: List[str],
+                   tenant: Optional[str], warnings: List[str]):
+    """Resolve names to discovered catalog/datastore identities. Returns (cats, dss, missing)."""
+    catalogs = client.get_catalogs(tenant if tenant and tenant.lower() != "system" else None)
+    datastores = client.get_datastores()
+    missing = []
+
+    def pick(name, items, kind, describe):
+        hits = [i for i in items if i.get("name") == name]
+        if not hits:
+            hits = [i for i in items if (i.get("name") or "").lower() == name.lower()]
+        if not hits:
+            missing.append(f"{kind} '{name}'")
+        elif len(hits) > 1:
+            warnings.append(f"{kind} name '{name}' matches {len(hits)} {kind}s "
+                            f"({', '.join(describe(h) for h in hits)}); scanning all of them")
+        return hits
+
+    cats, dss = [], []
+    for n in catalog_names:
+        cats.extend(pick(n, catalogs, "catalog", lambda c: f"org {c.get('orgName')}"))
+    for n in datastore_names:
+        dss.extend(pick(n, datastores, "datastore", lambda d: f"vCenter {d.get('vcName') or d.get('vc') or '?'}"))
+    return cats, dss, missing
+
+
+def _shadow_json(s: ShadowVM) -> dict:
+    return {
+        "name": s.name,
+        "id": s.vm_id,
+        "href": s.href,
+        "parent_template": s.container_name,
+        "template_href": s.template_href,
+        "catalog": s.catalog_name,
+        "org": s.org_name,
+        "datastore": s.datastore_name,
+        "datastore_href": s.datastore_href,
+        "vcenter": s.vc_name,
+        "match_strength": s.match_strength,
+        "match_rule": s.match_rule,
+        "parent_ref": s.parent_ref,
+        "ambiguous_with": s.ambiguous_with,
+    }
 
 
 def run_cli(args):
@@ -827,6 +1422,10 @@ def run_cli(args):
     # In JSON mode all progress/informational output goes to stderr so stdout
     # stays pure machine-readable JSON.
     info = sys.stderr if as_json else sys.stdout
+    include_weak = bool(getattr(args, "include_weak", False))
+    if getattr(args, "debug", False):
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr,
+                            format="DEBUG %(name)s: %(message)s")
 
     def emit_json(payload):
         print(json.dumps(payload, indent=2))
@@ -892,36 +1491,54 @@ def run_cli(args):
         print("ERROR: Provide --token, --username/--password, or --saved-server.", file=sys.stderr)
         return 1
 
+    args.server = normalize_host(args.server)
+
+    def fail(code: int, errors: list, extra: Optional[dict] = None):
+        for e in errors:
+            print(f"ERROR: {format_error(e)}", file=sys.stderr)
+        if as_json:
+            doc = {"server": args.server, "complete": False, "errors": errors}
+            doc.update(extra or {})
+            emit_json(doc)
+        return code
+
     if args.dry_run:
         print("\n*** DRY RUN MODE - No changes will be made ***\n", file=info)
 
     client = VCDClient(args.server, verify_ssl=not args.skip_ssl_verify)
 
     print(f"\nConnecting to {args.server}...", file=info)
-    with contextlib.redirect_stdout(info):
-        if token:
-            ok = client.authenticate_with_token(token, "system")
-        else:
-            ok = client.authenticate_with_credentials(username, password, "system")
-    if not ok:
-        print("ERROR: Authentication failed", file=sys.stderr)
-        return 1
+    try:
+        with contextlib.redirect_stdout(info):
+            if token:
+                client.authenticate_with_token(token, "system")
+            else:
+                client.authenticate_with_credentials(username, password, "system")
+    except VCDAuthError as e:
+        return fail(EXIT_AUTH, [e.to_dict()])
+    except VCDError as e:
+        return fail(EXIT_VCD, [e.to_dict()])
     print("Connected successfully!", file=info)
 
     try:
         # Discovery actions: list resources and exit without scanning.
         if args.list_tenants or args.list_catalogs or args.list_datastores:
             result = {}
-            with contextlib.redirect_stdout(info):
-                if args.list_tenants:
-                    result["tenants"] = [o.get("name", "") for o in client.get_organizations()]
-                if args.list_catalogs:
-                    result["catalogs"] = [
-                        {"name": c.get("name", ""), "org": c.get("orgName", "")}
-                        for c in client.get_catalogs(args.tenant)
-                    ]
-                if args.list_datastores:
-                    result["datastores"] = [d.get("name", "") for d in client.get_datastores()]
+            try:
+                with contextlib.redirect_stdout(info):
+                    if args.list_tenants:
+                        result["tenants"] = [o.get("name", "") for o in client.get_organizations()]
+                    if args.list_catalogs:
+                        result["catalogs"] = [
+                            {"name": c.get("name", ""), "org": c.get("orgName", ""), "href": c.get("href", "")}
+                            for c in client.get_catalogs(args.tenant)
+                        ]
+                    if args.list_datastores:
+                        result["datastores"] = [d.get("name", "") for d in client.get_datastores()]
+            except VCDError as e:
+                return fail(EXIT_VCD, [e.to_dict()], result)
+            result["complete"] = True
+            result["errors"] = []
             if as_json:
                 emit_json(result)
             else:
@@ -939,64 +1556,114 @@ def run_cli(args):
                         print(f"  {name}")
             return 0
 
-        # Switch to tenant if specified
-        if args.tenant and args.tenant.lower() != "system":
-            print(f"Switching to tenant: {args.tenant}", file=info)
-            client.switch_to_org(args.tenant)
+        tenant = args.tenant if args.tenant and args.tenant.lower() != "system" else None
+        if tenant:
+            print(f"Scoping to tenant: {tenant}", file=info)
+            client.switch_to_org(tenant)
 
         # Scan for Shadow VMs (support comma-separated catalog and datastore names from CLI)
         catalog_names = [c.strip() for c in args.catalog.split(",") if c.strip()]
         datastore_names = [d.strip() for d in args.datastore.split(",") if d.strip()]
+
+        warnings: List[str] = []
+        try:
+            with contextlib.redirect_stdout(info):
+                cats, dss, missing = _resolve_scope(client, catalog_names, datastore_names, tenant, warnings)
+        except VCDError as e:
+            return fail(EXIT_VCD, [e.to_dict()])
+        if missing:
+            print(f"ERROR: Not found{' in tenant ' + tenant if tenant else ''}: {', '.join(missing)}. "
+                  f"Use --list-catalogs / --list-datastores to see the names.", file=sys.stderr)
+            if as_json:
+                emit_json({"server": args.server, "complete": False,
+                           "errors": [{"type": "UsageError", "message": f"not found: {m}"} for m in missing]})
+            return EXIT_USAGE
+
         with contextlib.redirect_stdout(info):
-            shadows = scan_shadow_vms(client, catalog_names, datastore_names,
-                                      vcd_server=args.server, org_name=args.tenant or "system",
-                                      debug=args.debug)
+            scan = scan_shadow_vms(client, cats, dss, vcd_server=args.server, debug=args.debug)
+        scan.warnings[:0] = warnings
+        shadows = scan.shadows
+        for w in scan.warnings:
+            print(f"WARNING: {w}", file=sys.stderr)
+
+        exact = [s for s in shadows if s.match_strength == MATCH_EXACT]
+        weak = [s for s in shadows if s.is_weak]
+        to_delete = exact + (weak if include_weak else [])
 
         payload = {
             "server": args.server,
             "tenant": args.tenant or "system",
             "catalogs": catalog_names,
             "datastores": datastore_names,
+            "scope": {
+                "catalogs": [{"name": c.get("name"), "href": c.get("href"), "org": c.get("orgName")} for c in cats],
+                "datastores": [{"name": d.get("name"), "href": d.get("href"), "vcenter": d.get("vcName")}
+                               for d in dss],
+            },
             "dry_run": bool(args.dry_run),
+            "include_weak": include_weak,
+            "complete": scan.complete,
+            "errors": scan.errors,
+            "warnings": scan.warnings,
+            "counts": scan.counts,
             "count": len(shadows),
-            "shadow_vms": [
-                {
-                    "name": s.name,
-                    "parent_template": s.container_name,
-                    "catalog": s.catalog_name,
-                    "datastore": s.datastore_name,
-                    "href": s.href,
-                }
-                for s in shadows
-            ],
+            "delete_candidates": len(to_delete),
+            "shadow_vms": [_shadow_json(s) for s in shadows],
         }
 
         if not as_json:
             print_shadow_vm_table(shadows)
+            c = scan.counts
+            print(f"Matches: {c['exact']} exact, {c['weak']} weak (name/substring); "
+                  f"{c['other_template']} shadow VM(s) belong to other templates; {c['unmatched']} unmatched")
 
-        if not shadows:
+        if not scan.complete:
+            for e in scan.errors:
+                print(f"ERROR: {format_error(e)}", file=sys.stderr)
+            print("ERROR: Scan incomplete; results may be missing. Nothing will be deleted.", file=sys.stderr)
+            if as_json:
+                emit_json(payload)
+            return EXIT_VCD
+
+        if weak and not include_weak:
+            print(f"\n{len(weak)} weak (name/substring) match(es) are excluded from deletion; "
+                  f"pass --include-weak to include them.", file=info)
+
+        if not to_delete:
             if as_json:
                 emit_json(payload)
             return 0
 
         if args.dry_run:
-            print("\n*** DRY RUN COMPLETE - No Shadow VMs were deleted ***", file=info)
+            print(f"\n*** DRY RUN COMPLETE - would delete {len(to_delete)} Shadow VM(s) "
+                  f"({len(exact)} exact, {len(to_delete) - len(exact)} weak). Nothing was deleted ***", file=info)
             if as_json:
                 emit_json(payload)
             return 0
 
-        # Safety gate: deleting Shadow VMs is permanent. The CLI always requires
-        # an explicit typed confirmation here — there is deliberately no
-        # --yes/--force flag to bypass it. Use --dry-run for unattended analysis.
-        print(f"\nWARNING: About to PERMANENTLY delete {len(shadows)} Shadow VM(s) from {args.server}. "
-              f"This cannot be undone.", file=info)
-        print("Are you sure? Type 'yes' to confirm, anything else to cancel: ", file=info, end="", flush=True)
-        try:
-            response = input().strip().lower()
-        except EOFError:
-            response = ""
-            print("", file=info)
-        if response != "yes":
+        # Safety gate: deleting Shadow VMs is permanent. The confirmation is read from
+        # the controlling terminal, never stdin, so `echo yes |` cannot confirm it.
+        # There is deliberately no --yes/--force flag. Use --dry-run for unattended analysis.
+        lines = [f"\nWARNING: About to PERMANENTLY delete {len(to_delete)} Shadow VM(s) from {args.server}. "
+                 f"This cannot be undone.",
+                 f"  Exact matches (parent template reference): {len(exact)}"]
+        if include_weak and weak:
+            lines.append(f"  WEAK matches (name/substring only), included by --include-weak: {len(weak)}")
+            for s in weak:
+                lines.append(f"    - {s.name}  -> {s.container_name} [{s.match_strength}"
+                             f"{', ambiguous' if s.ambiguous_with else ''}]")
+        prompt = "\n".join(lines) + "\nAre you sure? Type 'yes' to confirm, anything else to cancel: "
+        answer = _confirm_on_terminal(prompt)
+        if answer is None:
+            print("\nREFUSED: deleting needs a person to confirm at a terminal, and no terminal is "
+                  "available (the confirmation is never read from stdin). No Shadow VMs were deleted. "
+                  "Run from an interactive terminal, or use --dry-run.", file=sys.stderr)
+            if as_json:
+                payload["confirmed"] = False
+                payload["refused"] = "no terminal for confirmation"
+                emit_json(payload)
+            return EXIT_NO_TERMINAL
+        if not answer:
             print("Operation cancelled. No Shadow VMs were deleted.", file=info)
             if as_json:
                 payload["confirmed"] = False
@@ -1005,40 +1672,43 @@ def run_cli(args):
 
         # Delete Shadow VMs
         print("\nDeleting Shadow VMs...", file=info)
-        success_count = 0
-        fail_count = 0
-        results = []
 
-        for i, shadow in enumerate(shadows, 1):
-            print(f"  [{i}/{len(shadows)}] Deleting {shadow.name}...", end=" ", file=info, flush=True)
-            success, message = client.delete_shadow_vm(shadow)
-            if success:
-                print("OK", file=info)
-                success_count += 1
-            else:
-                print(f"FAILED - {message}", file=info)
-                fail_count += 1
-            results.append({"name": shadow.name, "href": shadow.href,
-                            "success": success, "message": message})
-            # Same rate-limit pause between deletes as the GUI delete worker
-            if i < len(shadows):
-                time.sleep(3)
+        def on_start(i, shadow):
+            print(f"  [{i + 1}/{len(to_delete)}] Deleting {shadow.name}...", end=" ", file=info, flush=True)
 
-        print(f"\nDeletion complete: {success_count} succeeded, {fail_count} failed", file=info)
+        def on_result(r: DeleteResult):
+            if r.status == "skipped":
+                return
+            label = {"deleted": "OK", "accepted_unverified": "ACCEPTED (not verified)"}.get(r.status)
+            print(label if label else f"FAILED - {r.message}", file=info)
+
+        run = delete_shadow_vms(client, to_delete, on_start=on_start, on_result=on_result)
+        if run.stopped_reason:
+            print(f"\nSTOPPED: {run.stopped_reason} ({run.skipped} not attempted)", file=sys.stderr)
+        print(f"\nDeletion complete: {run.deleted} deleted, {run.unverified} accepted (not verified), "
+              f"{run.failed} failed, {run.skipped} skipped", file=info)
         if as_json:
             payload["confirmed"] = True
-            payload["succeeded"] = success_count
-            payload["failed"] = fail_count
-            payload["deletion_results"] = results
+            payload["succeeded"] = run.deleted + run.unverified
+            payload["deleted"] = run.deleted
+            payload["accepted_unverified"] = run.unverified
+            payload["failed"] = run.failed
+            payload["skipped"] = run.skipped
+            payload["stopped_reason"] = run.stopped_reason
+            payload["deletion_results"] = [r.to_dict() for r in run.results]
             emit_json(payload)
 
-        return 0 if fail_count == 0 else 1
+        return 0 if (run.failed == 0 and run.skipped == 0) else EXIT_DELETE_FAILED
     finally:
         client.disconnect()
 
 
-def run_gui():
-    """Run in GUI mode with PySide6."""
+def run_gui(build_only: bool = False):
+    """Run in GUI mode with PySide6.
+
+    build_only=True returns the GUI classes (for tests) without creating the
+    QApplication or entering the event loop.
+    """
     try:
         from PySide6.QtWidgets import (
             QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -1070,8 +1740,10 @@ def run_gui():
     COL_DATASTORE = 4
     COL_VCD = 5
     COL_ORG = 6
-    COLUMN_HEADERS = ["", "Parent Template", "Catalog", "Shadow VMs", "Datastore", "VCD Instance", "Org"]
-    FILTERABLE_COLUMNS = {COL_CATALOG, COL_TEMPLATE, COL_DATASTORE, COL_VCD, COL_ORG}
+    COL_MATCH = 7
+    COLUMN_HEADERS = ["", "Parent Template", "Catalog", "Shadow VMs", "Datastore", "VCD Instance", "Org",
+                      "Match"]
+    FILTERABLE_COLUMNS = {COL_CATALOG, COL_TEMPLATE, COL_DATASTORE, COL_VCD, COL_ORG, COL_MATCH}
 
     class ColumnFilterProxyModel(QSortFilterProxyModel):
         """Proxy that filters rows based on per-column allowed-value sets."""
@@ -1166,7 +1838,7 @@ def run_gui():
                     self.result_set.add(item.text())
             self.accept()
 
-    SORTABLE_COLUMNS = {COL_TEMPLATE, COL_CATALOG, COL_VMNAME, COL_DATASTORE, COL_VCD, COL_ORG}
+    SORTABLE_COLUMNS = {COL_TEMPLATE, COL_CATALOG, COL_VMNAME, COL_DATASTORE, COL_VCD, COL_ORG, COL_MATCH}
     NUMERIC_COLUMNS = {COL_VMNAME}
 
     class FilterHeaderView(QHeaderView):
@@ -1387,7 +2059,7 @@ def run_gui():
 
         def _on_save(self):
             name = self._name_input.text().strip()
-            server = self._server_input.text().strip()
+            server = normalize_host(self._server_input.text())
             if not name or not server:
                 QMessageBox.warning(self, "Required", "Display Name and VCD Server are required.")
                 return
@@ -1736,7 +2408,7 @@ def run_gui():
             self._populate_dlg_saved_combo()
 
         def _save_dlg_connection(self):
-            server = self._server_input.text().strip()
+            server = normalize_host(self._server_input.text())
             if not server:
                 QMessageBox.warning(self, "Error", "Please enter a VCD server address.")
                 return
@@ -1749,7 +2421,7 @@ def run_gui():
             servers = _load_saved_servers()
             existing = next(
                 (s for s in servers
-                 if s.get("server") == server
+                 if normalize_host(s.get("server", "")) == server
                  and s.get("auth_type") == ("token" if use_token else "password")
                  and s.get("username", "") == username),
                 None
@@ -1926,7 +2598,8 @@ def run_gui():
                 item = QListWidgetItem(display)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, catalog["name"])
+                # Keep the full catalog identity (href, owning org) so the scan can scope by it
+                item.setData(Qt.ItemDataRole.UserRole, dict(catalog))
                 self._catalog_list.addItem(item)
             self._catalog_list.setEnabled(True)
             self._cat_select_all.setEnabled(True)
@@ -1950,7 +2623,8 @@ def run_gui():
                 item = QListWidgetItem(display)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
-                item.setData(Qt.ItemDataRole.UserRole, ds["name"])
+                # Keep the full datastore identity (href, vCenter) so the scan can scope by it
+                item.setData(Qt.ItemDataRole.UserRole, dict(ds))
                 self._ds_list.addItem(item)
             self._ds_list.setEnabled(True)
             self._ds_select_all.setEnabled(True)
@@ -2004,7 +2678,7 @@ def run_gui():
             if org.startswith("--"):
                 org = "system"
             self._session = {
-                "server": self._server_input.text().strip(),
+                "server": normalize_host(self._server_input.text()),
                 "org": org,
                 "client": self._client,
                 "catalogs": catalogs,
@@ -2023,19 +2697,22 @@ def run_gui():
 
     class MainWindow(QMainWindow):
         class DeleteWorker(QThread):
-            """Deletes shadow VMs, running each VCD instance's sequential loop in parallel."""
-            progress = Signal(int, int, str)        # current, total, name
-            item_done = Signal(object, bool, str)   # shadow, success, message
-            finished = Signal(int, int)             # success_count, fail_count
+            """Deletes shadow VMs, running each VCD instance's sequential loop in parallel.
 
-            def __init__(self, parent, sessions, shadows, delay_seconds=3):
+            Each loop is the shared delete_shadow_vms() routine: a pause between deletes,
+            task polling, and a stop after repeated failures or a 401/403.
+            """
+            progress = Signal(int, int, str)        # current, total, name
+            item_done = Signal(object)              # DeleteResult
+            finished = Signal(object)               # summary dict
+
+            def __init__(self, parent, sessions, shadows, delay_seconds=DELETE_DELAY_SECONDS):
                 super().__init__(parent)
                 self.sessions = sessions    # list of session dicts with 'client'/'server'
                 self.shadows = shadows
                 self.delay_seconds = delay_seconds
 
             def run(self):
-                import time as _time
                 import threading
                 from concurrent.futures import ThreadPoolExecutor, as_completed
                 from collections import defaultdict
@@ -2057,44 +2734,45 @@ def run_gui():
                 def delete_group(server, group_shadows):
                     nonlocal completed_count
                     client = server_to_client.get(server)
-                    local_success = 0
-                    local_fail = 0
-                    for i, shadow in enumerate(group_shadows):
+                    if client is None:
+                        run = DeleteRun()
+                        for shadow in group_shadows:
+                            r = DeleteResult(shadow, "failed", f"No client for server '{server}'")
+                            run.results.append(r)
+                            self.item_done.emit(r)
+                        return server, run
+
+                    def on_start(_i, shadow):
+                        nonlocal completed_count
                         with progress_lock:
                             completed_count += 1
                             current = completed_count
-                        self.progress.emit(
-                            current, total_items, f"[{server}] {shadow.name}"
-                        )
-                        if client is None:
-                            self.item_done.emit(
-                                shadow, False, f"No client for server '{server}'"
-                            )
-                            local_fail += 1
-                        else:
-                            ok, msg = client.delete_shadow_vm(shadow)
-                            self.item_done.emit(shadow, ok, msg)
-                            if ok:
-                                local_success += 1
-                            else:
-                                local_fail += 1
-                        if i < len(group_shadows) - 1:
-                            _time.sleep(self.delay_seconds)
-                    return local_success, local_fail
+                        self.progress.emit(current, total_items, f"[{server}] {shadow.name}")
 
-                total_success = 0
-                total_fail = 0
+                    run = delete_shadow_vms(client, group_shadows, delay_seconds=self.delay_seconds,
+                                            on_start=on_start, on_result=self.item_done.emit)
+                    return server, run
+
+                summary = {"deleted": 0, "unverified": 0, "failed": 0, "skipped": 0, "stopped": []}
                 with ThreadPoolExecutor(max_workers=max(1, len(groups))) as executor:
                     futs = [
                         executor.submit(delete_group, srv, shds)
                         for srv, shds in groups.items()
                     ]
                     for fut in as_completed(futs):
-                        s, f = fut.result()
-                        total_success += s
-                        total_fail += f
+                        try:
+                            server, run = fut.result()
+                        except Exception as e:  # unexpected bug in one group: report, keep others
+                            summary["stopped"].append(f"delete loop error: {e}")
+                            continue
+                        summary["deleted"] += run.deleted
+                        summary["unverified"] += run.unverified
+                        summary["failed"] += run.failed
+                        summary["skipped"] += run.skipped
+                        if run.stopped_reason:
+                            summary["stopped"].append(f"{server}: {run.stopped_reason}")
 
-                self.finished.emit(total_success, total_fail)
+                self.finished.emit(summary)
 
         def __init__(self):
             super().__init__()
@@ -2198,6 +2876,17 @@ def run_gui():
             clear_all_btn.clicked.connect(self._clear_all_filters)
             filter_row.addWidget(clear_all_btn)
 
+            # Bulk selection (header and group checkboxes) picks only exact matches unless
+            # this is on. Weak (name/substring) matches can always be checked one by one.
+            self.include_weak_check = QCheckBox("Include weak matches in bulk select")
+            self.include_weak_check.setToolTip(
+                "Off: the header and group checkboxes select only exact matches (the shadow VM's "
+                "parent template reference is a selected template).\nOn: they also select weak "
+                "matches, found only by name or substring."
+            )
+            self.include_weak_check.setStyleSheet("font-size: 11px;")
+            filter_row.addWidget(self.include_weak_check)
+
             filter_row.addStretch()
 
             expand_all_btn = QPushButton("Expand All")
@@ -2256,6 +2945,7 @@ def run_gui():
             self.results_table.setColumnWidth(COL_CHECK, 40)
             for c in (COL_TEMPLATE, COL_CATALOG, COL_VMNAME, COL_DATASTORE, COL_VCD, COL_ORG):
                 header.setSectionResizeMode(c, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(COL_MATCH, QHeaderView.ResizeMode.ResizeToContents)
 
             self._tree_model.itemChanged.connect(self._on_item_changed)
 
@@ -2311,28 +3001,42 @@ def run_gui():
                         ):
                             yield child_chk
 
-        def _on_header_select_all_clicked(self):
-            """Toggle all visible child rows when the header checkbox is clicked."""
-            # Determine next state: if anything is unchecked, check all; otherwise uncheck all
-            header = self.results_table.header()
-            current = header._check_state
-            if current == Qt.CheckState.Checked:
-                new_check = Qt.CheckState.Unchecked
+        def _shadow_for_check_item(self, chk_item: QStandardItem):
+            parent = chk_item.parent()
+            if parent is None:
+                return None
+            cat_cell = parent.child(chk_item.row(), COL_CATALOG)
+            return cat_cell.data(SHADOW_VM_ROLE) if cat_cell else None
+
+        def _bulk_eligible(self, chk_item: QStandardItem) -> bool:
+            """Bulk select picks exact matches, and weak ones only with the toggle on."""
+            shadow = self._shadow_for_check_item(chk_item)
+            if shadow is None:
+                return False
+            return shadow.match_strength == MATCH_EXACT or self.include_weak_check.isChecked()
+
+        def _bulk_toggle(self, chk_items: list) -> None:
+            """Check the eligible items; if they are all checked already, uncheck every item."""
+            eligible = [c for c in chk_items if self._bulk_eligible(c)]
+            if eligible and any(c.checkState() != Qt.CheckState.Checked for c in eligible):
+                for c in eligible:
+                    c.setCheckState(Qt.CheckState.Checked)
             else:
-                new_check = Qt.CheckState.Checked
-            self._select_all_state = (new_check == Qt.CheckState.Checked)
+                for c in chk_items:
+                    c.setCheckState(Qt.CheckState.Unchecked)
+
+        def _on_header_select_all_clicked(self):
+            """Toggle visible child rows when the header checkbox is clicked (exact only by default)."""
             root_idx = self._tree_model.invisibleRootItem().index()
-            self._tree_model.blockSignals(True)
+            visible_groups = []
             for group_row in range(self._tree_model.rowCount()):
                 group_item = self._tree_model.item(group_row, 0)
-                if group_item is None:
+                if group_item is None or self.results_table.isRowHidden(group_row, root_idx):
                     continue
-                if self.results_table.isRowHidden(group_row, root_idx):
-                    continue
-                for child_row in range(group_item.rowCount()):
-                    child_chk = group_item.child(child_row, COL_CHECK)
-                    if child_chk:
-                        child_chk.setCheckState(new_check)
+                visible_groups.append(group_item)
+            self._tree_model.blockSignals(True)
+            self._bulk_toggle(list(self._iter_visible_child_check_items()))
+            for group_item in visible_groups:
                 self._update_group_checkbox(group_item)
             self._tree_model.blockSignals(False)
             self._update_selected_count()
@@ -2342,20 +3046,15 @@ def run_gui():
             self.results_table.viewport().update()
 
         def _on_group_checkbox_clicked(self, group_item: QStandardItem):
-            """When a group-row checkbox is toggled, apply state to all children."""
-            new_check = group_item.checkState()
-            # If the new state is PartiallyChecked (from a user click cycling tri-state),
-            # treat it as Checked so clicking always goes to a definite state.
-            if new_check == Qt.CheckState.PartiallyChecked:
-                new_check = Qt.CheckState.Checked
-                self._tree_model.blockSignals(True)
-                group_item.setCheckState(new_check)
-                self._tree_model.blockSignals(False)
+            """A group-row click checks its exact children (weak too with the toggle on);
+            when those are all checked already, it unchecks every child."""
+            children = [
+                group_item.child(r, COL_CHECK) for r in range(group_item.rowCount())
+                if group_item.child(r, COL_CHECK) is not None
+            ]
             self._tree_model.blockSignals(True)
-            for child_row in range(group_item.rowCount()):
-                child_chk = group_item.child(child_row, COL_CHECK)
-                if child_chk:
-                    child_chk.setCheckState(new_check)
+            self._bulk_toggle(children)
+            self._update_group_checkbox(group_item)
             self._tree_model.blockSignals(False)
             self._update_selected_count()
             self._update_header_check_state()
@@ -2610,16 +3309,11 @@ def run_gui():
                 self._update_header_check_state()
 
         def _update_selected_count(self):
-            selected = 0
-            for group_row in range(self._tree_model.rowCount()):
-                group_item = self._tree_model.item(group_row, 0)
-                if group_item is None:
-                    continue
-                for child_row in range(group_item.rowCount()):
-                    child_chk = group_item.child(child_row, COL_CHECK)
-                    if child_chk and child_chk.checkState() == Qt.CheckState.Checked:
-                        selected += 1
-            self.statusBar().showMessage(f"Selected Shadow VMs: {selected}")
+            visible, hidden = self._collect_delete_selection()
+            msg = f"Selected Shadow VMs: {len(visible)}"
+            if hidden:
+                msg += f" ({hidden} more checked but hidden by filters; they will not be deleted)"
+            self.statusBar().showMessage(msg)
 
         def _update_header_check_state(self):
             """Sync the header checkbox in col 0 to reflect visible child row states."""
@@ -2769,27 +3463,7 @@ def run_gui():
             self.progress_bar.setVisible(True)
             self.progress_bar.setRange(0, 0)
 
-            def run_parallel_scan():
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-
-                def scan_one(session):
-                    return scan_shadow_vms(
-                        session["client"],
-                        session["catalogs"],
-                        session["datastores"],
-                        vcd_server=session["server"],
-                        org_name=session["org"],
-                        debug=False,
-                    )
-
-                all_shadows = []
-                with ThreadPoolExecutor(max_workers=max(1, len(all_sessions))) as executor:
-                    futures = [executor.submit(scan_one, s) for s in all_sessions]
-                    for future in as_completed(futures):
-                        all_shadows.extend(future.result())
-                return all_shadows
-
-            self.scan_worker = WorkerThread(run_parallel_scan)
+            self.scan_worker = WorkerThread(scan_sessions, all_sessions)
             self.scan_worker.finished.connect(self._on_scan_finished)
             self.scan_worker.error.connect(self._on_scan_error)
             self.scan_worker.start()
@@ -2804,7 +3478,11 @@ def run_gui():
                 self, "Scan Error", f"Failed to scan for Shadow VMs:\n{error_message}"
             )
 
-        def _on_scan_finished(self, shadow_vms):
+        def _on_scan_finished(self, scan_result):
+            if isinstance(scan_result, ScanResult):
+                shadow_vms = scan_result.shadows
+            else:  # a plain list of ShadowVM
+                shadow_vms, scan_result = list(scan_result), ScanResult(shadows=list(scan_result))
             self.shadow_vms = shadow_vms
 
             # Clear filters, sort state, and rebuild model
@@ -2879,8 +3557,15 @@ def run_gui():
                 grp_org.setEditable(False)
                 grp_org.setData(True, IS_GROUP_ROLE)
 
+                strengths = {s.match_strength == MATCH_EXACT for s in group_shadows}
+                grp_match = QStandardItem(
+                    "exact" if strengths == {True} else ("weak" if strengths == {False} else "mixed")
+                )
+                grp_match.setEditable(False)
+                grp_match.setData(True, IS_GROUP_ROLE)
+
                 self._tree_model.appendRow(
-                    [grp_chk, grp_tpl, grp_cat, grp_vm, grp_ds, grp_vcd, grp_org]
+                    [grp_chk, grp_tpl, grp_cat, grp_vm, grp_ds, grp_vcd, grp_org, grp_match]
                 )
 
                 # Child rows: VM name (indented) in COL_TEMPLATE; VCD/Org blank (implied by group)
@@ -2910,8 +3595,25 @@ def run_gui():
                     org_item = QStandardItem("")
                     org_item.setEditable(False)
 
+                    match_text = shadow.match_strength or "?"
+                    if shadow.ambiguous_with:
+                        match_text += " (ambiguous)"
+                    match_item = QStandardItem(match_text)
+                    match_item.setEditable(False)
+                    tip = f"Rule: {shadow.match_rule or '?'}"
+                    if shadow.parent_ref:
+                        tip += f"\nParent reference: {shadow.parent_ref}"
+                    if shadow.ambiguous_with:
+                        tip += "\nAlso fits: " + ", ".join(
+                            f"{a.get('template')} [{a.get('catalog')}]" for a in shadow.ambiguous_with
+                        )
+                    match_item.setToolTip(tip)
+                    if shadow.is_weak:
+                        match_item.setForeground(QColor(255, 167, 38))
+                        tpl_item.setToolTip("Weak match (name/substring only): not selected by bulk select")
+
                     grp_chk.appendRow(
-                        [chk_item, tpl_item, cat_item, vm_item, ds_item, vcd_item, org_item]
+                        [chk_item, tpl_item, cat_item, vm_item, ds_item, vcd_item, org_item, match_item]
                     )
 
             self._tree_model.setHorizontalHeaderLabels(COLUMN_HEADERS)
@@ -2920,43 +3622,96 @@ def run_gui():
             # Collapse all groups by default
             self.results_table.collapseAll()
 
-            self.summary_label.setText(f"Found {len(self.shadow_vms)} Shadow VMs")
+            counts = scan_result.counts
+            self.summary_label.setText(
+                f"Found {len(self.shadow_vms)} Shadow VMs ({counts['exact']} exact, {counts['weak']} weak)"
+                + ("" if scan_result.complete else " - INCOMPLETE, see log")
+            )
             self.progress_bar.setVisible(False)
             self.scan_btn.setEnabled(True)
             self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
             self.results_table.header().set_check_state(Qt.CheckState.Unchecked)
-            self.statusBar().showMessage(f"Scan complete: {len(self.shadow_vms)} Shadow VMs found")
-            self.log(f"Scan complete: {len(self.shadow_vms)} Shadow VMs")
+            state = "complete" if scan_result.complete else "INCOMPLETE"
+            self.statusBar().showMessage(f"Scan {state}: {len(self.shadow_vms)} Shadow VMs found")
+            self.log(
+                f"Scan {state}: {len(self.shadow_vms)} Shadow VMs ({counts['exact']} exact, "
+                f"{counts['weak']} weak); {counts['other_template']} belong to other templates, "
+                f"{counts['unmatched']} unmatched"
+            )
+            for w in scan_result.warnings:
+                self.log(f"Warning: {w}")
+            for e in scan_result.errors:
+                self.log(f"Error: {format_error(e)}")
             self._update_selected_count()
+            if not scan_result.complete:
+                QMessageBox.warning(
+                    self, "Scan Incomplete",
+                    "Some queries failed, so these results are partial:\n\n"
+                    + "\n".join(format_error(e) for e in scan_result.errors[:10])
+                )
 
         # ---- cleanup ----
 
-        def cleanup_shadows(self):
-            if not self.vcd_sessions:
-                return
-
-            selected_shadow_vms = []
+        def _collect_delete_selection(self):
+            """Return (checked shadows in visible rows, count of checked rows hidden by filters)."""
+            visible = []
+            visible_ids = set()
+            for chk in self._iter_visible_child_check_items():
+                if chk.checkState() == Qt.CheckState.Checked:
+                    shadow = self._shadow_for_check_item(chk)
+                    if shadow is not None:
+                        visible.append(shadow)
+                        visible_ids.add(id(shadow))
+            hidden = 0
             for group_row in range(self._tree_model.rowCount()):
                 group_item = self._tree_model.item(group_row, 0)
                 if group_item is None:
                     continue
                 for child_row in range(group_item.rowCount()):
-                    child_chk = group_item.child(child_row, COL_CHECK)
-                    if child_chk and child_chk.checkState() == Qt.CheckState.Checked:
-                        cat_cell = group_item.child(child_row, COL_CATALOG)
-                        if cat_cell:
-                            shadow = cat_cell.data(SHADOW_VM_ROLE)
-                            if shadow:
-                                selected_shadow_vms.append(shadow)
+                    chk = group_item.child(child_row, COL_CHECK)
+                    if chk and chk.checkState() == Qt.CheckState.Checked:
+                        shadow = self._shadow_for_check_item(chk)
+                        if shadow is not None and id(shadow) not in visible_ids:
+                            hidden += 1
+            return visible, hidden
+
+        def _delete_confirmation_text(self, selected: list, hidden: int) -> str:
+            exact = [s for s in selected if s.match_strength == MATCH_EXACT]
+            weak = [s for s in selected if s.match_strength != MATCH_EXACT]
+            lines = [
+                f"Are you sure you want to delete {len(selected)} selected Shadow VMs?",
+                "",
+                f"Exact matches (parent template reference): {len(exact)}",
+                f"WEAK matches (name/substring only): {len(weak)}",
+            ]
+            for s in weak[:10]:
+                lines.append(f"    - {s.name}  ->  {s.container_name} [{s.match_strength or '?'}]")
+            if len(weak) > 10:
+                lines.append(f"    ... and {len(weak) - 10} more")
+            if hidden:
+                lines += ["", f"{hidden} checked row(s) hidden by the current filters will be skipped "
+                              f"(not deleted)."]
+            lines += ["", "This action cannot be undone!"]
+            return "\n".join(lines)
+
+        def cleanup_shadows(self):
+            if not self.vcd_sessions:
+                return
+
+            # Only rows visible under the current filters are deleted.
+            selected_shadow_vms, hidden = self._collect_delete_selection()
 
             if not selected_shadow_vms:
-                QMessageBox.information(self, "No Selection", "No Shadow VMs selected for deletion.")
+                msg = "No Shadow VMs selected for deletion."
+                if hidden:
+                    msg += (f"\n\n{hidden} checked row(s) are hidden by the current filters; hidden rows "
+                            f"are never deleted.")
+                QMessageBox.information(self, "No Selection", msg)
                 return
 
             reply = QMessageBox.question(
                 self, "Confirm Deletion",
-                f"Are you sure you want to delete {len(selected_shadow_vms)} selected Shadow VMs?\n\n"
-                "This action cannot be undone!",
+                self._delete_confirmation_text(selected_shadow_vms, hidden),
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No
             )
@@ -2986,14 +3741,20 @@ def run_gui():
             self.progress_bar.setValue(current)
             self.statusBar().showMessage(f"Deleting {current}/{total}: {name}")
 
-        def _on_delete_item_done(self, shadow, success: bool, message: str):
-            if success:
+        def _on_delete_item_done(self, result):
+            shadow = result.shadow
+            if result.status == "deleted":
                 self.log(f"Deleted: {shadow.name}")
                 self._deleted_shadow_ids.add(id(shadow))
+            elif result.status == "accepted_unverified":
+                self.log(f"Accepted, not verified: {shadow.name} - {result.message}")
+                self._deleted_shadow_ids.add(id(shadow))
+            elif result.status == "skipped":
+                self.log(f"Skipped: {shadow.name} - {result.message}")
             else:
-                self.log(f"Failed: {shadow.name} - {message}")
+                self.log(f"Failed: {shadow.name} - {result.message}")
 
-        def _on_delete_finished(self, success_count: int, fail_count: int):
+        def _on_delete_finished(self, summary: dict):
             deleted_shadows = self._deleted_shadow_ids
 
             # Remove deleted child rows from tree model; remove empty group rows
@@ -3024,14 +3785,22 @@ def run_gui():
             self.scan_btn.setEnabled(True)
             self.cleanup_btn.setEnabled(len(self.shadow_vms) > 0)
             self._update_summary()
-            self.statusBar().showMessage(f"Deletion complete: {success_count} succeeded, {fail_count} failed")
-            self.log(f"Deletion complete: {success_count} succeeded, {fail_count} failed")
+            text = (f"Deleted: {summary['deleted']}, accepted (not verified): {summary['unverified']}, "
+                    f"failed: {summary['failed']}, skipped: {summary['skipped']}")
+            self.statusBar().showMessage(f"Deletion complete: {text}")
+            self.log(f"Deletion complete: {text}")
+            for reason in summary.get("stopped", []):
+                self.log(f"Stopped: {reason}")
             self._update_selected_count()
 
-            QMessageBox.information(
-                self, "Deletion Complete",
-                f"Deletion complete!\n\nSuccessful: {success_count}\nFailed: {fail_count}"
+            body = (
+                f"Deletion complete.\n\nDeleted (confirmed by VCD): {summary['deleted']}\n"
+                f"Accepted, not verified: {summary['unverified']}\n"
+                f"Failed: {summary['failed']}\nSkipped: {summary['skipped']}"
             )
+            if summary.get("stopped"):
+                body += "\n\n" + "\n".join(summary["stopped"])
+            QMessageBox.information(self, "Deletion Complete", body)
 
         def closeEvent(self, event):
             # Wait for any running background worker so the app doesn't crash with
@@ -3046,6 +3815,10 @@ def run_gui():
                 except Exception:
                     pass
             event.accept()
+
+    if build_only:
+        return {"MainWindow": MainWindow, "VCDInstanceDialog": VCDInstanceDialog,
+                "WorkerThread": WorkerThread}
 
     # Run the application
     app = QApplication(sys.argv)
@@ -3108,9 +3881,16 @@ Examples:
     # .env file is also supported
     python vcd_shadow_cleaner.py --cli --tenant MyTenant --catalog MyCatalog --datastore MyDatastore
 
-Deletion is permanent. Unless --dry-run is given, the CLI always asks
-"Are you sure?" and requires typing 'yes' before any Shadow VM is deleted;
-there is no flag to skip that confirmation.
+Deletion is permanent. Unless --dry-run is given, the CLI asks "Are you sure?"
+on the controlling terminal (/dev/tty, or CONIN$ on Windows) and requires typing
+'yes'. The answer is never read from stdin, so piping 'yes' cannot confirm it; with
+no terminal the CLI refuses to delete (exit 5). There is no flag to skip it.
+By default only exact matches (the shadow VM's parent template reference is a
+selected template) are deleted; --include-weak adds name/substring matches.
+
+Exit codes: 0 success; 1 internal/usage error; 2 catalog or datastore not found;
+3 authentication failed; 4 VCD or network error (results incomplete, nothing
+deleted); 5 delete refused (no terminal); 7 some deletes failed or were skipped.
         """
     )
 
@@ -3141,6 +3921,9 @@ there is no flag to skip that confirmation.
                         help="Connect, list datastores, and exit. Implies --cli.")
 
     parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without making changes")
+    parser.add_argument("--include-weak", action="store_true",
+                        help="Also delete weak matches (found only by name or substring). By default only "
+                             "exact matches (parent template reference) are deleted.")
     parser.add_argument("--json", action="store_true",
                         help="Print results as JSON on stdout (progress goes to stderr); for scripts and AI agents")
     parser.add_argument("--debug", action="store_true", help="Enable verbose debug output during the scan")
