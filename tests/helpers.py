@@ -160,3 +160,47 @@ def shadows_of(result):
 
 def by_name(result):
     return {s.name: s for s in shadows_of(result)}
+
+
+class FakeKeyringError(Exception):
+    pass
+
+
+class FakeKeyringBackend:
+    """Stands in for keyring.get_keyring()'s result (not a keyring.backends.fail backend)."""
+
+
+class FakeKeyring:
+    """In-memory stand-in for the keyring module; never touches the real keychain.
+
+    fail_set: set_password raises. readback: if set, get_password returns this value for
+    entries written by set_password (simulates a read-back mismatch).
+    """
+
+    def __init__(self):
+        self.store = {}
+        self.fail_set = False
+        self.readback = None
+        self._written = set()
+        self.deleted = []
+
+    def get_keyring(self):
+        return FakeKeyringBackend()
+
+    def get_password(self, service, sid):
+        if self.readback is not None and (service, sid) in self._written:
+            return self.readback
+        return self.store.get((service, sid))
+
+    def set_password(self, service, sid, value):
+        if self.fail_set:
+            raise FakeKeyringError("backend locked")
+        self.store[(service, sid)] = value
+        self._written.add((service, sid))
+
+    def delete_password(self, service, sid):
+        self.deleted.append((service, sid))
+        if (service, sid) not in self.store:
+            raise FakeKeyringError("not found")
+        del self.store[(service, sid)]
+        self._written.discard((service, sid))

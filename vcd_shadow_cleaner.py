@@ -20,6 +20,7 @@ Usage:
                 python vcd_shadow_cleaner.py --cli --saved-server <name> \
                     --catalog <catalog_name> --datastore <datastore_name>
                 python vcd_shadow_cleaner.py --cli --list-servers
+                python vcd_shadow_cleaner.py --migrate-credentials [--dry-run] [--json]
                 python vcd_shadow_cleaner.py --cli --saved-server <name> \
                     [--list-tenants] [--list-catalogs] [--list-datastores]
 """
@@ -50,7 +51,7 @@ _KEYRING_SERVICE = "vcd-shadow-cleaner"
 
 from dataclasses import dataclass, field
 from typing import Optional, List, Set, Tuple, Callable
-from datetime import datetime
+from datetime import datetime, timezone
 
 import requests
 
@@ -244,8 +245,69 @@ def _persist_saved_servers(servers: list) -> None:
         os.chmod(_SERVERS_FILE, 0o600)
 
 
-def _get_credential(server_id: str) -> str:
-    """Return stored password/token for a saved server, or empty string.
+def _base64_warning_text() -> str:
+    """User-facing explanation of the base64 fallback and how to fix it."""
+    if _KEYRING_AVAILABLE:
+        fix = ("The system keyring could not be used. Fix the keyring backend, then run "
+               "'python vcd_shadow_cleaner.py --migrate-credentials' to move stored credentials into it.")
+    else:
+        fix = ("Install the keyring package ('pip install keyring'), then run "
+               "'python vcd_shadow_cleaner.py --migrate-credentials' to move stored credentials into "
+               "the system keyring.")
+    return (f"Saved-server credentials are stored base64-encoded (NOT encrypted) in {_SERVERS_FILE}. "
+            f"Anyone who can read that file can recover them. {fix}")
+
+
+# One warning per process, whichever path (read or write) hits the fallback first.
+_base64_warning_shown = False
+
+
+def _warn_base64_once(show: Optional[Callable[[str], None]] = None) -> bool:
+    """Show the base64-fallback warning once per process. Returns True if shown now.
+
+    `show` receives the message (the GUI passes a dialog); the default prints to stderr.
+    """
+    global _base64_warning_shown
+    if _base64_warning_shown:
+        return False
+    _base64_warning_shown = True
+    text = _base64_warning_text()
+    if show is None:
+        print(f"WARNING: {text}", file=sys.stderr)
+    else:
+        show(text)
+    return True
+
+
+def _b64_entry_credential(server_id: str) -> Optional[str]:
+    """Decode the base64 credential stored for server_id, or None if there is none."""
+    for s in _load_saved_servers():
+        if s.get("id") == server_id:
+            raw = s.get("_credential_b64", "")
+            if raw:
+                try:
+                    return base64.b64decode(raw.encode()).decode()
+                except Exception:
+                    return None
+            return None
+    return None
+
+
+def _remove_b64_credential(server_id: str) -> bool:
+    """Drop any `_credential_b64` for server_id from servers.json. Returns True if removed."""
+    servers = _load_saved_servers()
+    changed = False
+    for s in servers:
+        if s.get("id") == server_id and "_credential_b64" in s:
+            s.pop("_credential_b64", None)
+            changed = True
+    if changed:
+        _persist_saved_servers(servers)
+    return changed
+
+
+def _get_credential_with_source(server_id: str) -> Tuple[str, str]:
+    """Return (credential, source) where source is "keyring", "base64" or "" (none found).
 
     Tries the keyring first and falls back to the base64 store in servers.json when
     the keyring is unavailable, fails, or has nothing for this server.
@@ -254,29 +316,33 @@ def _get_credential(server_id: str) -> str:
         try:
             result = keyring.get_password(_KEYRING_SERVICE, server_id)
             if result:
-                return result
+                return result, "keyring"
         except Exception:
             pass
-    # fallback: base64 in JSON
-    for s in _load_saved_servers():
-        if s.get("id") == server_id:
-            raw = s.get("_credential_b64", "")
-            if raw:
-                try:
-                    return base64.b64decode(raw.encode()).decode()
-                except Exception:
-                    return ""
-    return ""
+    value = _b64_entry_credential(server_id)
+    if value:
+        return value, "base64"
+    return "", ""
 
 
-def _set_credential(server_id: str, credential: str) -> None:
-    """Store password/token for a saved server."""
+def _get_credential(server_id: str) -> str:
+    """Return stored password/token for a saved server, or empty string (keyring, then base64)."""
+    return _get_credential_with_source(server_id)[0]
+
+
+def _set_credential(server_id: str, credential: str) -> str:
+    """Store password/token for a saved server. Returns the store used: "keyring" or "base64".
+
+    On a successful keyring write any leftover base64 copy in servers.json is removed.
+    """
     if _KEYRING_AVAILABLE:
         try:
             keyring.set_password(_KEYRING_SERVICE, server_id, credential)
-            return
         except Exception:
             pass
+        else:
+            _remove_b64_credential(server_id)
+            return "keyring"
     # fallback: base64 in JSON
     servers = _load_saved_servers()
     for s in servers:
@@ -284,22 +350,137 @@ def _set_credential(server_id: str, credential: str) -> None:
             s["_credential_b64"] = base64.b64encode(credential.encode()).decode()
             break
     _persist_saved_servers(servers)
+    return "base64"
 
 
 def _delete_credential(server_id: str) -> None:
-    """Remove stored credential for a saved server."""
+    """Remove the stored credential for a saved server from the keyring and servers.json."""
     if _KEYRING_AVAILABLE:
         try:
             keyring.delete_password(_KEYRING_SERVICE, server_id)
         except Exception:
             pass
-    else:
-        servers = _load_saved_servers()
-        for s in servers:
-            if s.get("id") == server_id:
-                s.pop("_credential_b64", None)
-                break
+    _remove_b64_credential(server_id)
+
+
+def _gui_warn_base64_once(parent) -> bool:
+    """GUI flavour of _warn_base64_once: a warning dialog, once per process."""
+    from PySide6.QtWidgets import QMessageBox
+    return _warn_base64_once(
+        lambda text: QMessageBox.warning(parent, "Credentials not encrypted", text))
+
+
+def _keyring_usable() -> bool:
+    """True when the keyring module is importable and has a real (non-"fail") backend."""
+    if not _KEYRING_AVAILABLE:
+        return False
+    get_keyring = getattr(keyring, "get_keyring", None)
+    if get_keyring is None:
+        return True
+    try:
+        backend = get_keyring()
+    except Exception:
+        return False
+    return "keyring.backends.fail" not in type(backend).__module__
+
+
+def _backup_servers_file() -> str:
+    """Copy servers.json to servers.json.bak-<UTC timestamp> with mode 0600; return the path."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    with open(_SERVERS_FILE, "rb") as f:
+        data = f.read()
+    base = f"{_SERVERS_FILE}.bak-{stamp}"
+    path, n = base, 0
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            n += 1
+            path = f"{base}-{n}"
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+    return path
+
+
+def migrate_credentials(dry_run: bool = False) -> dict:
+    """Move base64 credentials from servers.json into the system keyring.
+
+    Per server with `_credential_b64`: if the keyring already holds the same value the base64
+    copy is dropped (already_in_keyring_same); if it holds a different value nothing changes
+    (conflict); otherwise the value is written, read back, and the base64 copy dropped only
+    when the read-back matches (migrated), else kept (failed). servers.json is backed up first
+    and written once at the end. The result never contains a credential value or its length.
+    """
+    servers = _load_saved_servers()
+    results = []
+    candidates = [s for s in servers if isinstance(s, dict) and s.get("_credential_b64")]
+    skipped = len(servers) - len(candidates)
+    backup = None
+    if candidates and not dry_run:
+        backup = _backup_servers_file()
+    changed = False
+    for s in candidates:
+        sid = s.get("id", "")
+        row = {"id": sid, "name": s.get("name", ""), "server": s.get("server", ""),
+               "outcome": "", "detail": ""}
+        results.append(row)
+        try:
+            value = base64.b64decode(str(s["_credential_b64"]).encode()).decode()
+        except Exception:
+            value = ""
+        if not value:
+            row["outcome"], row["detail"] = "failed", "stored base64 value could not be decoded"
+            continue
+        if not sid:
+            row["outcome"], row["detail"] = "failed", "entry has no id"
+            continue
+        try:
+            existing = keyring.get_password(_KEYRING_SERVICE, sid)
+        except Exception as e:
+            row["outcome"], row["detail"] = "failed", f"keyring read failed ({type(e).__name__})"
+            continue
+        if existing:
+            if existing == value:
+                row["outcome"] = "already_in_keyring_same"
+                if not dry_run:
+                    s.pop("_credential_b64", None)
+                    changed = True
+                    row["detail"] = "base64 copy removed"
+                else:
+                    row["detail"] = "base64 copy would be removed"
+            else:
+                row["outcome"] = "conflict"
+                row["detail"] = "keyring holds a different value; both left unchanged"
+            continue
+        if dry_run:
+            row["outcome"] = "would_migrate"
+            continue
+        try:
+            keyring.set_password(_KEYRING_SERVICE, sid, value)
+            readback = keyring.get_password(_KEYRING_SERVICE, sid)
+        except Exception as e:
+            row["outcome"], row["detail"] = "failed", f"keyring write failed ({type(e).__name__})"
+            continue
+        if readback == value:
+            s.pop("_credential_b64", None)
+            changed = True
+            row["outcome"] = "migrated"
+        else:
+            # Don't leave a wrong keyring value in front of the good base64 copy.
+            with contextlib.suppress(Exception):
+                keyring.delete_password(_KEYRING_SERVICE, sid)
+            row["outcome"] = "failed"
+            row["detail"] = "keyring read-back did not match; base64 copy kept"
+    if changed:
         _persist_saved_servers(servers)
+    ok = all(r["outcome"] in ("migrated", "already_in_keyring_same", "would_migrate") for r in results)
+    return {"servers_file": _SERVERS_FILE, "dry_run": dry_run, "backup": backup,
+            "results": results, "skipped_without_base64": skipped, "ok": ok}
 
 
 def _find_saved_server(name_or_id: str) -> Optional[dict]:
@@ -1416,6 +1597,43 @@ def _shadow_json(s: ShadowVM) -> dict:
     }
 
 
+def _run_migrate_credentials(args, emit_json) -> int:
+    """CLI front end for migrate_credentials(); prints outcomes, never credential values."""
+    if not _keyring_usable():
+        msg = ("--migrate-credentials needs a working system keyring. Install the keyring package "
+               "('pip install keyring') and make sure it has a backend (macOS Keychain, Windows "
+               "Credential Manager, or Secret Service on Linux).")
+        if args.json:
+            emit_json({"ok": False, "error": msg})
+        print(f"ERROR: {msg}", file=sys.stderr)
+        return 1
+    try:
+        report = migrate_credentials(dry_run=args.dry_run)
+    except Exception as e:
+        msg = f"Credential migration failed: {type(e).__name__}"
+        if args.json:
+            emit_json({"ok": False, "error": msg})
+        print(f"ERROR: {msg}", file=sys.stderr)
+        return 1
+    if args.json:
+        emit_json(report)
+    else:
+        mode = " (dry run: nothing changed)" if report["dry_run"] else ""
+        print(f"Credential migration for {report['servers_file']}{mode}")
+        if report["backup"]:
+            print(f"Backup written: {report['backup']} (it still holds the base64 credentials; "
+                  f"delete it once you have checked the migration)")
+        if not report["results"]:
+            print("No base64-stored credentials found; nothing to migrate.")
+        for r in report["results"]:
+            detail = f"  ({r['detail']})" if r["detail"] else ""
+            label = r["name"] or "?"
+            print(f"  {r['id']:<36}  {label:<30} {r['server']:<40} {r['outcome']}{detail}")
+        if report["skipped_without_base64"]:
+            print(f"Servers without a base64 credential (left as is): {report['skipped_without_base64']}")
+    return 0 if report["ok"] else 1
+
+
 def run_cli(args):
     """Run in CLI mode."""
     as_json = args.json
@@ -1429,6 +1647,10 @@ def run_cli(args):
 
     def emit_json(payload):
         print(json.dumps(payload, indent=2))
+
+    # --migrate-credentials only touches the local profile store and the keyring.
+    if getattr(args, "migrate_credentials", False):
+        return _run_migrate_credentials(args, emit_json)
 
     # --list-servers needs no connection at all.
     if args.list_servers:
@@ -1475,7 +1697,9 @@ def run_cli(args):
             args.skip_ssl_verify = True
         if not args.tenant:
             args.tenant = profile.get("org") or None
-        credential = _get_credential(profile.get("id", ""))
+        credential, cred_source = _get_credential_with_source(profile.get("id", ""))
+        if cred_source == "base64":
+            _warn_base64_once()
         if credential:
             if profile.get("auth_type") == "token":
                 token, username, password = credential, None, None
@@ -2019,7 +2243,8 @@ def run_gui(build_only: bool = False):
                     self._password_input.setText(prefill_credential)
 
             if not _KEYRING_AVAILABLE:
-                warn = QLabel("Warning: keyring not installed — credentials stored as base64 in config file (not encrypted).")
+                warn = QLabel("Warning: keyring not installed — credentials will be stored base64-encoded (NOT encrypted) "
+                              "in servers.json. Install keyring (pip install keyring) to use the system keychain.")
                 warn.setStyleSheet("color: #ffb74d; font-size: 11px;")
                 warn.setWordWrap(True)
                 layout.addWidget(warn)
@@ -2090,7 +2315,8 @@ def run_gui(build_only: bool = False):
                 servers.append(entry)
             _persist_saved_servers(servers)
             if new_credential:
-                _set_credential(server_id, new_credential)
+                if _set_credential(server_id, new_credential) == "base64":
+                    _gui_warn_base64_once(self)
             self._saved_entry = entry
             self.accept()
 
@@ -2479,7 +2705,9 @@ def run_gui(build_only: bool = False):
             use_token = entry.get("auth_type") == "token"
             self._token_check.setChecked(use_token)
             self._on_auth_toggle()
-            cred = _get_credential(server_id)
+            cred, cred_source = _get_credential_with_source(server_id)
+            if cred_source == "base64":
+                _gui_warn_base64_once(self)
             if use_token:
                 self._token_input.setText(cred)
             else:
@@ -3818,7 +4046,7 @@ def run_gui(build_only: bool = False):
 
     if build_only:
         return {"MainWindow": MainWindow, "VCDInstanceDialog": VCDInstanceDialog,
-                "WorkerThread": WorkerThread}
+                "WorkerThread": WorkerThread, "EditSavedServerDialog": EditSavedServerDialog}
 
     # Run the application
     app = QApplication(sys.argv)
@@ -3867,6 +4095,10 @@ Examples:
     python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \\
         --catalog MyCatalog --datastore MyDatastore --dry-run
 
+    # Move base64-stored credentials into the system keyring (preview first)
+    python vcd_shadow_cleaner.py --migrate-credentials --dry-run
+    python vcd_shadow_cleaner.py --migrate-credentials
+
     # List saved connection profiles / discover resource names
     python vcd_shadow_cleaner.py --cli --list-servers
     python vcd_shadow_cleaner.py --cli --saved-server "Production VCD" \\
@@ -3908,6 +4140,10 @@ deleted); 5 delete refused (no terminal); 7 some deletes failed or were skipped.
                              "Implies --cli.")
     parser.add_argument("--list-servers", action="store_true",
                         help="List saved server profiles (credentials are never shown) and exit. Implies --cli.")
+    parser.add_argument("--migrate-credentials", action="store_true",
+                        help="Move saved-server credentials stored base64-encoded in servers.json into the "
+                             "system keyring, then exit. Backs up servers.json first; with --dry-run only "
+                             "reports what would happen. Credential values are never shown. Implies --cli.")
 
     parser.add_argument("--tenant", default=os.environ.get("VCD_TENANT"), help="Target tenant/organization name")
     parser.add_argument("--catalog", "-c", default=os.environ.get("VCD_CATALOG"), help="Catalog name(s) to scan, comma-separated")
@@ -3932,13 +4168,14 @@ deleted); 5 delete refused (no terminal); 7 some deletes failed or were skipped.
     args = parser.parse_args()
 
     # CLI-only actions imply --cli; otherwise default to GUI
-    cli_mode = (args.cli or args.saved_server or args.list_servers
+    cli_mode = (args.cli or args.saved_server or args.list_servers or args.migrate_credentials
                 or args.list_tenants or args.list_catalogs or args.list_datastores)
     if not cli_mode:
         return run_gui()
 
-    # --list-servers only reads the local profile store; no connection args needed
-    if args.list_servers:
+    # --list-servers / --migrate-credentials only touch the local profile store
+    # (and the keyring); no connection args needed
+    if args.list_servers or args.migrate_credentials:
         return run_cli(args)
 
     if not args.server and not args.saved_server:

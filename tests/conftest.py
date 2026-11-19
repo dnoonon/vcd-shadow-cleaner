@@ -37,7 +37,7 @@ def vsc():
 
 @pytest.fixture(autouse=True)
 def _isolate(vsc, monkeypatch, tmp_path):
-    """No real terminal, no real sleeping, no real config dir, no VCD_* env vars."""
+    """No real terminal, no real sleeping, no real config dir, no real keyring, no VCD_* env vars."""
     for var in ("VCD_SERVER", "VCD_TOKEN", "VCD_USER", "VCD_PASSWORD", "VCD_TENANT",
                 "VCD_CATALOG", "VCD_DATASTORE", "VCD_SKIP_SSL"):
         monkeypatch.delenv(var, raising=False)
@@ -47,6 +47,17 @@ def _isolate(vsc, monkeypatch, tmp_path):
     monkeypatch.setattr(vsc, "_SERVERS_FILE", str(cfg / "servers.json"))
     monkeypatch.setattr(vsc, "_open_tty", lambda: None, raising=False)
     monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    # Never touch the real system keychain: an empty in-memory keyring by default.
+    from helpers import FakeKeyring
+    monkeypatch.setattr(vsc, "keyring", FakeKeyring(), raising=False)
+    monkeypatch.setattr(vsc, "_KEYRING_AVAILABLE", True)
+    monkeypatch.setattr(vsc, "_base64_warning_shown", False, raising=False)
+
+
+@pytest.fixture
+def fake_keyring(vsc):
+    """The in-memory keyring installed by _isolate for this test."""
+    return vsc.keyring
 
 
 @pytest.fixture

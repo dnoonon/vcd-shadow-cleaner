@@ -85,6 +85,17 @@ python vcd_shadow_cleaner.py --cli --server <vcd_host> --token <api_token> \
 
 **Using stored credentials:** server profiles saved in the GUI (Manage Saved Servers) can be reused from the CLI with `--saved-server <name>`. The profile supplies the server hostname, the stored credential (retrieved from the OS keyring), the default org, and the SSL setting. Stored credentials are only ever used to authenticate the shadow-VM scan/cleanup session — they are never printed or used for anything else.
 
+**How credentials are stored:** profiles live in `~/.vcd-shadow-cleaner/servers.json` (mode 0600). The password or token goes into the OS keyring (macOS Keychain, Windows Credential Manager, Secret Service on Linux) through the `keyring` package. If `keyring` is not installed or the keyring write fails, the credential is stored **base64-encoded, not encrypted**, in `servers.json` under `_credential_b64`, and the tool warns once (a dialog in the GUI, a stderr line in the CLI). Reads try the keyring first, then the base64 copy. Saving a credential to the keyring removes any base64 copy, and deleting a profile removes both.
+
+**Moving base64 credentials into the keyring:** after installing `keyring`, run
+
+```bash
+python vcd_shadow_cleaner.py --migrate-credentials --dry-run   # preview, changes nothing
+python vcd_shadow_cleaner.py --migrate-credentials [--json]
+```
+
+It backs up `servers.json` to `servers.json.bak-<UTC timestamp>` (mode 0600), writes each base64 credential to the keyring and reads it back, and drops the base64 copy only when the read-back matches. When the keyring already holds a *different* value for a profile, neither copy is changed and the profile is reported as a `conflict`. Each profile gets one outcome: `migrated`, `already_in_keyring_same`, `conflict`, `failed` or (dry run) `would_migrate`; credential values are never shown. It exits 0 when everything migrated or there was nothing to do, and 1 on any conflict or failure, or when no keyring is available. The backup still contains the base64 credentials: delete it once you have checked the result.
+
 **Examples:**
 
 * **List saved server profiles (credentials are never shown):**
