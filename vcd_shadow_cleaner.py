@@ -23,10 +23,14 @@ Usage:
                 python vcd_shadow_cleaner.py --migrate-credentials [--dry-run] [--json]
                 python vcd_shadow_cleaner.py --cli --saved-server <name> \
                     [--list-tenants] [--list-catalogs] [--list-datastores]
+    Agent analysis (read-only, JSON on stdout; see docs/AGENTS.md):
+                python vcd_shadow_cleaner.py profiles list | orgs | catalogs | datastores | scan | plan
 """
 
 import argparse
 import contextlib
+import fnmatch
+import hashlib
 import sys
 import json
 import logging
@@ -532,6 +536,10 @@ class ShadowVM:
     match_rule: str = ""         # parent_ref | container_name | name_prefix | name_token
     template_href: str = ""      # href of the matched template
     ambiguous_with: List[dict] = field(default_factory=list)
+    template_id: str = ""        # id of the matched template
+    datastore_id: str = ""       # id of the scanned datastore this record came from
+    # The raw adminShadowVM query record (for the agent scan document)
+    record: dict = field(default_factory=dict, repr=False, compare=False)
 
     @property
     def is_weak(self) -> bool:
@@ -613,6 +621,10 @@ class ScanResult:
     unmatched: int = 0            # no parent reference and no name match
     errors: List[dict] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    # The shadows behind the other_template / unmatched counts, and the templates scanned
+    other_template_shadows: List[ShadowVM] = field(default_factory=list)
+    unmatched_shadows: List[ShadowVM] = field(default_factory=list)
+    templates: List["VAppTemplate"] = field(default_factory=list)
 
     @property
     def complete(self) -> bool:
@@ -639,6 +651,9 @@ class ScanResult:
         self.unmatched += other.unmatched
         self.errors.extend(other.errors)
         self.warnings.extend(other.warnings)
+        self.other_template_shadows.extend(other.other_template_shadows)
+        self.unmatched_shadows.extend(other.unmatched_shadows)
+        self.templates.extend(other.templates)
 
 
 def format_error(err) -> str:
@@ -1129,6 +1144,7 @@ class VCDClient:
             container_name_from_field=bool(field_name),
             datastore_href=record.get("datastore", "") or "",
             vc_name=record.get("vcName", "") or "",
+            record=dict(record),
         )
 
     def get_shadow_vms_on_datastore(self, datastore, debug: bool = False,
@@ -1165,6 +1181,7 @@ class VCDClient:
                 shadow.datastore_href = ident.get("href", "") or ""
             if not shadow.vc_name:
                 shadow.vc_name = ident.get("vcName", "") or ""
+            shadow.datastore_id = ident.get("id") or ident.get("href") or shadow.datastore_href
             shadows.append(shadow)
         if warnings is not None and unscoped:
             warnings.append(f"datastore '{name}': {unscoped} shadow VM record(s) carry no datastore/"
@@ -1424,6 +1441,7 @@ def scan_shadow_vms(client: VCDClient, catalogs, datastores, vcd_server: str = "
             if not t.catalog_name:
                 t.catalog_name = cat_name
             all_templates.append(t)
+    result.templates = list(all_templates)
 
     template_by_ref: dict = {}
     for t in all_templates:
@@ -1475,11 +1493,13 @@ def scan_shadow_vms(client: VCDClient, catalogs, datastores, vcd_server: str = "
             shadow.match_strength, shadow.match_rule = MATCH_EXACT, "parent_ref"
         elif shadow.parent_ref:
             result.other_template += 1
+            result.other_template_shadows.append(shadow)
             continue
         else:
             hit = _match_templates(shadow, ordered)
             if hit is None:
                 result.unmatched += 1
+                result.unmatched_shadows.append(shadow)
                 continue
             shadow.match_strength, shadow.match_rule, tpl, others = hit
             shadow.ambiguous_with = amb(others)
@@ -1487,6 +1507,7 @@ def scan_shadow_vms(client: VCDClient, catalogs, datastores, vcd_server: str = "
         shadow.container_name = tpl.name
         shadow.catalog_name = tpl.catalog_name
         shadow.template_href = tpl.href
+        shadow.template_id = tpl.id or tpl.href
         shadow.org_name = tpl.org_name
         shadow.vcd_server = vcd_server
         result.shadows.append(shadow)
@@ -1645,6 +1666,51 @@ def _shadow_json(s: ShadowVM) -> dict:
         "parent_ref": s.parent_ref,
         "ambiguous_with": s.ambiguous_with,
     }
+
+
+# ---- Template filters (legacy --cli and the agent subcommands) ----
+
+def _template_pattern_matches(name: str, pattern: str) -> bool:
+    """A template name matches a pattern when it equals it, or fits it as a case-sensitive glob."""
+    name = name or ""
+    return name == pattern or fnmatch.fnmatchcase(name, pattern)
+
+
+def _template_filter_reason(name: str, include, exclude) -> str:
+    """'' when a template name passes the filters, else template_not_included / template_excluded."""
+    if include and not any(_template_pattern_matches(name, p) for p in include):
+        return "template_not_included"
+    if exclude and any(_template_pattern_matches(name, p) for p in exclude):
+        return "template_excluded"
+    return ""
+
+
+def filter_scan_by_template(scan: ScanResult, include=None, exclude=None) -> Tuple[ScanResult, List[ShadowVM]]:
+    """Keep the matched shadows whose matched template name passes --template / --exclude-template.
+
+    Returns (filtered scan, shadows filtered out). The filter runs after matching against
+    every template in the selected catalogs, so it never changes which template a shadow
+    matched: with 'web' and 'web-v2' in one catalog, --template web does not pick up
+    web-v2's shadows through a name-prefix match. A pattern that matches no scanned
+    template adds a warning (a typo in an exclude would otherwise widen the selection).
+    """
+    include = [p for p in (include or []) if p]
+    exclude = [p for p in (exclude or []) if p]
+    if not include and not exclude:
+        return scan, []
+    kept, dropped = [], []
+    for s in scan.shadows:
+        (dropped if _template_filter_reason(s.container_name, include, exclude) else kept).append(s)
+    out = ScanResult(shadows=kept, other_template=scan.other_template, unmatched=scan.unmatched,
+                     errors=scan.errors, warnings=list(scan.warnings),
+                     other_template_shadows=scan.other_template_shadows,
+                     unmatched_shadows=scan.unmatched_shadows, templates=scan.templates)
+    names = [t.name for t in scan.templates]
+    for flag, patterns in (("--template", include), ("--exclude-template", exclude)):
+        for p in patterns:
+            if not any(_template_pattern_matches(n, p) for n in names):
+                out.warnings.append(f"{flag} '{p}' matches no template in the scanned catalogs")
+    return out, dropped
 
 
 def _run_migrate_credentials(args, emit_json) -> int:
@@ -1856,6 +1922,11 @@ def run_cli(args):
         with contextlib.redirect_stdout(info):
             scan = scan_shadow_vms(client, cats, dss, vcd_server=args.server, debug=args.debug)
         scan.warnings[:0] = warnings
+        tpl_include = list(getattr(args, "template", None) or [])
+        tpl_exclude = list(getattr(args, "exclude_template", None) or [])
+        filtered_out: List[ShadowVM] = []
+        if tpl_include or tpl_exclude:
+            scan, filtered_out = filter_scan_by_template(scan, tpl_include, tpl_exclude)
         shadows = scan.shadows
         for w in scan.warnings:
             print(f"WARNING: {w}", file=sys.stderr)
@@ -1884,12 +1955,18 @@ def run_cli(args):
             "delete_candidates": len(to_delete),
             "shadow_vms": [_shadow_json(s) for s in shadows],
         }
+        if tpl_include or tpl_exclude:
+            payload["template_filter"] = {"include": tpl_include, "exclude": tpl_exclude,
+                                          "filtered_out": len(filtered_out)}
 
         if not as_json:
             print_shadow_vm_table(shadows)
             c = scan.counts
             print(f"Matches: {c['exact']} exact, {c['weak']} weak (name/substring); "
                   f"{c['other_template']} shadow VM(s) belong to other templates; {c['unmatched']} unmatched")
+            if tpl_include or tpl_exclude:
+                print(f"Template filter: {len(filtered_out)} matched shadow VM(s) left out "
+                      f"(include: {', '.join(tpl_include) or 'all'}; exclude: {', '.join(tpl_exclude) or 'none'})")
 
         if not scan.complete:
             for e in scan.errors:
@@ -1975,6 +2052,774 @@ def run_cli(args):
         return 0 if (run.failed == 0 and run.skipped == 0) else EXIT_DELETE_FAILED
     finally:
         client.disconnect()
+
+
+# ======================================================================
+# Agent analysis subcommands: profiles, orgs, catalogs, datastores, scan, plan.
+#
+# Read-only by construction: they use ReadOnlyVCDClient, which refuses every request
+# except GETs and the authentication POST, and they never call a delete routine. Each
+# writes one schema-versioned JSON document (stdout, or --out FILE); everything else
+# goes to stderr. Secrets come from a saved profile or stdin, never from argv.
+# ======================================================================
+
+SCHEMA_SCAN = "vcd-shadow-cleaner.scan/1"
+SCHEMA_PLAN = "vcd-shadow-cleaner.plan/1"
+SCHEMA_DISCOVERY = "vcd-shadow-cleaner.discovery/1"
+SCHEMA_PROFILES = "vcd-shadow-cleaner.profiles/1"
+EXIT_INTERRUPTED = 130
+AGENT_SUBCOMMANDS = ("profiles", "orgs", "catalogs", "datastores", "scan", "plan")
+_MATCH_RANK = {MATCH_EXACT: 0, MATCH_NAME: 1, MATCH_SUBSTRING: 2}
+
+
+class AgentUsageError(Exception):
+    """Exit 2: bad input, or a name that doesn't resolve to exactly one object."""
+
+    def __init__(self, errors: List[dict]):
+        super().__init__("; ".join(e.get("message", "") for e in errors))
+        self.errors = errors
+
+
+class ReadOnlyVCDClient(VCDClient):
+    """A VCDClient that can't change anything: GETs, plus the POST that logs in.
+
+    disconnect() still logs the session out (DELETE /api/session), which ends this
+    tool's own session and touches no VCD object.
+    """
+
+    def _request(self, method: str, url: str, *, stage: str, **kwargs):
+        m = method.upper()
+        if not (m == "GET" or (m == "POST" and stage == "auth")):
+            raise RuntimeError(f"read-only client refused {m} {url} (stage {stage!r})")
+        return super()._request(method, url, stage=stage, **kwargs)
+
+    def delete_shadow_vm(self, shadow_vm: ShadowVM) -> DeleteResult:
+        raise RuntimeError("the analysis subcommands cannot delete")
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _usage_error(message: str, *, target: str = "", **extra) -> dict:
+    err = {"type": "UsageError", "stage": "arguments", "target": target, "http_status": None,
+           "message": message}
+    err.update(extra)
+    return err
+
+
+def _resolution_error(kind: str, query: str, by: str, reason: str, candidates: List[dict]) -> dict:
+    what = f"{kind} {'id' if by == 'id' else 'name'} '{query}'"
+    retry = {"catalog": "--catalog-id", "datastore": "--datastore-id", "profile": "--profile <id>"}
+    if reason == "ambiguous":
+        how = f"retry with {retry[kind]} and one of" if kind in retry else "candidates"
+        msg = (f"{what} matches {len(candidates)} {kind}s; {how}: "
+               + ", ".join(f"{c.get('id')} ({c.get('name')}"
+                           + (f", {c['org']}" if c.get("org") else "")
+                           + (f", vCenter {c['vcenter']}" if c.get("vcenter") else "") + ")"
+                           for c in candidates))
+    else:
+        lister = "profiles list" if kind == "profile" else f"{kind}s"
+        msg = f"{what} not found; run the '{lister}' subcommand to list them"
+    return {"type": "ResolutionError", "stage": "resolve", "target": what, "http_status": None,
+            "message": msg, "kind": kind, "query": query, "by": by, "reason": reason,
+            "candidates": candidates}
+
+
+def _id_matches(query: str, item: dict) -> bool:
+    q = (query or "").strip()
+    if not q:
+        return False
+    refs = [r for r in (item.get("id"), item.get("href")) if r]
+    if q in refs:
+        return True
+    return any(_ref_key(q) == _ref_key(r) for r in refs)
+
+
+def _pick_one(kind: str, query: str, by: str, items: List[dict], describe) -> Tuple[Optional[dict], Optional[dict]]:
+    """Resolve one --KIND / --KIND-id value to exactly one item. Returns (item, error)."""
+    if by == "id":
+        hits = [i for i in items if _id_matches(query, i)]
+    else:
+        hits = [i for i in items if i.get("name") == query]
+        if not hits:
+            hits = [i for i in items if (i.get("name") or "").lower() == (query or "").lower()]
+    if len(hits) == 1:
+        return hits[0], None
+    reason = "ambiguous" if hits else "not_found"
+    return None, _resolution_error(kind, query, by, reason, [describe(h) for h in hits])
+
+
+def _org_item(o: dict) -> dict:
+    href = o.get("href") or ""
+    return {"id": o.get("id") or href, "name": o.get("name") or "", "href": href}
+
+
+def _catalog_item(c: dict) -> dict:
+    return {"id": c.get("id") or c.get("href") or "", "name": c.get("name") or "",
+            "href": c.get("href") or "", "org": c.get("orgName") or "",
+            "org_href": c.get("org") or "", "is_shared": bool(c.get("isShared")),
+            "is_published": bool(c.get("isPublished"))}
+
+
+def _datastore_item(d: dict) -> dict:
+    return {"id": d.get("id") or d.get("href") or "", "name": d.get("name") or "",
+            "href": d.get("href") or "", "vcenter": d.get("vcName") or "", "vc": d.get("vc") or "",
+            "type": d.get("datastoreType") or ""}
+
+
+def _catalog_candidate(c: dict) -> dict:
+    i = _catalog_item(c)
+    return {k: i[k] for k in ("id", "name", "href", "org")}
+
+
+def _datastore_candidate(d: dict) -> dict:
+    i = _datastore_item(d)
+    return {k: i[k] for k in ("id", "name", "href", "vcenter")}
+
+
+def _profile_item(s: dict) -> dict:
+    return {"id": s.get("id", "") or "", "name": s.get("name", "") or "",
+            "server": normalize_host(s.get("server", "")), "auth_type": s.get("auth_type", "") or "",
+            "username": s.get("username", "") or "", "default_org": s.get("org", "") or "",
+            "skip_ssl_verify": bool(s.get("skip_ssl_verify", True))}
+
+
+def _resolve_profile(query: str) -> dict:
+    """A saved profile by id, then display name, then hostname; exactly one must match."""
+    servers = [s for s in _load_saved_servers() if isinstance(s, dict)]
+    q = (query or "").strip()
+    tiers = (
+        lambda s: s.get("id") == q,
+        lambda s: (s.get("name") or "").strip().lower() == q.lower(),
+        lambda s: normalize_host(s.get("server", "")).lower() == normalize_host(q).lower(),
+    )
+    for test in tiers:
+        hits = [s for s in servers if test(s)]
+        if len(hits) == 1:
+            return hits[0]
+        if hits:
+            cands = [{k: _profile_item(h)[k] for k in ("id", "name", "server")} for h in hits]
+            raise AgentUsageError([_resolution_error("profile", q, "name", "ambiguous", cands)])
+    raise AgentUsageError([_resolution_error("profile", q, "name", "not_found", [])])
+
+
+def _read_secret(what: str) -> str:
+    """One line from stdin (or a hidden prompt when stdin is a terminal); never from argv."""
+    stream = sys.stdin
+    if stream is None:
+        raise AgentUsageError([_usage_error(f"no stdin to read the {what} from")])
+    try:
+        interactive = stream.isatty()
+    except (AttributeError, ValueError):
+        interactive = False
+    if interactive:
+        import getpass
+        secret = getpass.getpass(f"{what}: ", stream=sys.stderr)
+    else:
+        secret = stream.readline()
+    secret = secret.rstrip("\r\n")
+    if not secret:
+        raise AgentUsageError([_usage_error(f"no {what} on stdin (pipe it in; it is never read from argv)")])
+    return secret
+
+
+def _agent_target(args) -> dict:
+    """Server, SSL setting and credential from --profile, or from --server plus stdin."""
+    if args.profile:
+        profile = _resolve_profile(args.profile)
+        server = normalize_host(profile.get("server", ""))
+        target = {"server": server, "verify_ssl": not profile.get("skip_ssl_verify", True),
+                  "profile": _profile_item(profile), "token": None, "username": None, "password": None}
+        if not server:
+            raise AgentUsageError([_usage_error(f"saved profile '{args.profile}' has no server",
+                                                target="profile")])
+        credential, source = _get_credential_with_source(profile.get("id", ""))
+        if source == "base64":
+            _warn_base64_once()
+        if not credential:
+            raise VCDAuthError(f"no stored credential for saved profile '{profile.get('name')}'; "
+                               f"re-save it in the GUI (Manage Saved Servers)",
+                               stage="auth", target="profile")
+        if profile.get("auth_type") == "token":
+            target["token"] = credential
+        else:
+            target["username"], target["password"] = profile.get("username", ""), credential
+        return target
+    server = normalize_host(args.server)
+    if not server:
+        raise AgentUsageError([_usage_error("--server is empty", target="--server")])
+    target = {"server": server, "verify_ssl": not args.skip_ssl_verify, "profile": None,
+              "token": None, "username": None, "password": None}
+    if args.token_stdin:
+        target["token"] = _read_secret("API token")
+    else:
+        target["username"] = args.username
+        target["password"] = _read_secret("password")
+    return target
+
+
+def _agent_connect(target: dict) -> ReadOnlyVCDClient:
+    client = ReadOnlyVCDClient(target["server"], verify_ssl=target["verify_ssl"])
+    print(f"Connecting to {target['server']}...", file=sys.stderr)
+    if target["token"]:
+        client.authenticate_with_token(target["token"], "system")
+    else:
+        client.authenticate_with_credentials(target["username"], target["password"], "system")
+    print("Connected.", file=sys.stderr)
+    return client
+
+
+def _resolve_org(client: VCDClient, name: Optional[str]) -> Optional[str]:
+    """--org must name exactly one organization. 'system' (or none) means provider-wide."""
+    if not name or name.strip().lower() == "system":
+        return None
+    orgs = [_org_item(o) for o in client.get_organizations()]
+    hit, err = _pick_one("org", name.strip(), "name", orgs, lambda o: dict(o))
+    if err:
+        raise AgentUsageError([err])
+    return hit["name"]
+
+
+def _write_private_file(path: str, text: str) -> None:
+    """Write text to path atomically, mode 0600 (a scan holds the server's raw records)."""
+    directory = os.path.dirname(os.path.abspath(path))
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".vsc.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        raise
+
+
+def _emit_document(doc: dict, stdout, out_path: Optional[str] = None) -> None:
+    text = json.dumps(doc, indent=2) + "\n"
+    if out_path:
+        _write_private_file(out_path, text)
+        print(f"Wrote {doc.get('schema')} document to {out_path}", file=sys.stderr)
+    else:
+        stdout.write(text)
+        stdout.flush()
+
+
+def _report(doc: dict, rc: int) -> None:
+    for e in doc.get("errors") or []:
+        print(f"ERROR: {format_error(e)}", file=sys.stderr)
+    for w in doc.get("warnings") or []:
+        print(f"WARNING: {w}", file=sys.stderr)
+    print(f"{doc.get('schema')}: complete={str(doc.get('complete')).lower()} exit={rc} "
+          f"counts={json.dumps(doc.get('counts'), sort_keys=True)}", file=sys.stderr)
+
+
+def _run_connected(args, stdout, doc: dict, body, out_path: Optional[str] = None) -> int:
+    """Authenticate, run body(client, doc) -> rc, map errors to exit codes, emit doc."""
+    client = None
+    try:
+        target = _agent_target(args)
+        doc["server"] = target["server"]
+        client = _agent_connect(target)
+        rc = body(client, doc)
+    except AgentUsageError as e:
+        doc["complete"] = False
+        doc["errors"].extend(e.errors)
+        rc = EXIT_USAGE
+    except VCDAuthError as e:
+        doc["complete"] = False
+        doc["errors"].append(e.to_dict())
+        rc = EXIT_AUTH
+    except VCDError as e:
+        doc["complete"] = False
+        doc["errors"].append(e.to_dict())
+        rc = EXIT_VCD
+    finally:
+        if client is not None:
+            client.disconnect()
+    _report(doc, rc)
+    _emit_document(doc, stdout, out_path)
+    return rc
+
+
+# ---- profiles / orgs / catalogs / datastores ----
+
+def _cmd_profiles(args, stdout) -> int:
+    profiles = [_profile_item(s) for s in _load_saved_servers() if isinstance(s, dict)]
+    doc = {"schema": SCHEMA_PROFILES, "generated_at": _now_iso(), "complete": True, "errors": [],
+           "warnings": [], "counts": {"profiles": len(profiles)}, "profiles": profiles}
+    _report(doc, EXIT_OK)
+    _emit_document(doc, stdout)
+    return EXIT_OK
+
+
+def _cmd_discovery(args, stdout) -> int:
+    kind = args.command
+    doc = {"schema": SCHEMA_DISCOVERY, "kind": kind, "generated_at": _now_iso(), "server": None,
+           "org": None, "complete": False, "errors": [], "warnings": [], "counts": {"items": 0},
+           "items": []}
+
+    def body(client, doc):
+        if kind == "orgs":
+            items = [_org_item(o) for o in client.get_organizations()]
+        elif kind == "catalogs":
+            org = _resolve_org(client, args.org)
+            doc["org"] = org
+            items = [_catalog_item(c) for c in client.get_catalogs(org)]
+        else:
+            items = [_datastore_item(d) for d in client.get_datastores()]
+        doc["items"] = items
+        doc["counts"] = {"items": len(items)}
+        doc["complete"] = True
+        return EXIT_OK
+
+    return _run_connected(args, stdout, doc, body)
+
+
+# ---- scan ----
+
+def _evidence_field(record: dict, value: str, keys) -> str:
+    for k in keys:
+        if value and record.get(k) == value:
+            return k
+    return ""
+
+
+def _match_evidence(s: ShadowVM, strength: str) -> dict:
+    rec = s.record or {}
+    ref_keys = ("primaryVAppTemplate", "vAppTemplate", "container", "entity")
+    if strength == MATCH_EXACT:
+        tpl_keys = {_ref_key(r) for r in (s.template_href, s.template_id) if r}
+        value = s.parent_ref if s.parent_ref and _ref_key(s.parent_ref) in tpl_keys else (
+            s.container_id or s.parent_ref)
+        return {"rule": s.match_rule or "parent_ref", "field": _evidence_field(rec, value, ref_keys),
+                "value": value, "template_href": s.template_href}
+    if strength == "other_template":
+        return {"rule": "parent_ref_not_selected",
+                "field": _evidence_field(rec, s.parent_ref, ref_keys), "value": s.parent_ref}
+    if strength in WEAK_MATCHES:
+        if s.match_rule == "container_name":
+            fld = _evidence_field(rec, s.container_name, ("containerName", "container", "vappTemplate",
+                                                          "catalogItem"))
+            return {"rule": "container_name", "field": fld, "value": s.container_name,
+                    "token": s.container_name}
+        return {"rule": s.match_rule, "field": "name", "value": s.name, "token": s.container_name}
+    return {"rule": "none"}
+
+
+def _scan_shadow_entry(s: ShadowVM, strength: str) -> dict:
+    matched = strength in _MATCH_RANK
+    template = ({"id": s.template_id, "name": s.container_name, "href": s.template_href,
+                 "catalog": s.catalog_name, "org": s.org_name} if matched else None)
+    return {
+        "id": s.vm_id,
+        "href": s.href,
+        "name": s.name,
+        "datastore": {"id": s.datastore_id, "name": s.datastore_name, "href": s.datastore_href,
+                      "vcenter": s.vc_name},
+        "match": {"strength": strength, "template": template, "evidence": _match_evidence(s, strength),
+                  "ambiguous_with": list(s.ambiguous_with) if matched else []},
+        "record": s.record or {},
+    }
+
+
+def _cmd_scan(args, stdout) -> int:
+    include, exclude = list(args.template or []), list(args.exclude_template or [])
+    doc = {"schema": SCHEMA_SCAN, "generated_at": _now_iso(), "server": None,
+           "scope": {"org": None, "catalogs": [], "datastores": [],
+                     "template_filter": {"include": include, "exclude": exclude},
+                     "include_unmatched": bool(args.include_unmatched)},
+           "complete": False, "errors": [], "warnings": [],
+           "counts": {"exact": 0, "name": 0, "substring": 0, "weak": 0, "ambiguous": 0,
+                      "other_template": 0, "unmatched": 0, "filtered_out": 0, "templates": 0,
+                      "listed": 0},
+           "shadows": []}
+
+    def body(client, doc):
+        org = _resolve_org(client, args.org)
+        doc["scope"]["org"] = org
+        catalogs = client.get_catalogs(org)
+        datastores = client.get_datastores()
+        errors: List[dict] = []
+
+        def resolve(kind, names, ids, items, describe):
+            out, seen = [], set()
+            for by, values in (("name", names or []), ("id", ids or [])):
+                for v in dict.fromkeys(values):
+                    hit, err = _pick_one(kind, v, by, items, describe)
+                    if err:
+                        errors.append(err)
+                        continue
+                    key = hit.get("href") or hit.get("id") or id(hit)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(hit)
+            return out
+
+        cats = resolve("catalog", args.catalog, args.catalog_id, catalogs, _catalog_candidate)
+        dss = resolve("datastore", args.datastore, args.datastore_id, datastores, _datastore_candidate)
+        if errors:
+            raise AgentUsageError(errors)
+        doc["scope"]["catalogs"] = [{k: v for k, v in _catalog_item(c).items()
+                                     if k in ("id", "name", "href", "org", "org_href")} for c in cats]
+        doc["scope"]["datastores"] = [{k: v for k, v in _datastore_item(d).items()
+                                       if k in ("id", "name", "href", "vcenter", "vc")} for d in dss]
+
+        scan = scan_shadow_vms(client, cats, dss, vcd_server=doc["server"], debug=args.debug)
+        scan, dropped = filter_scan_by_template(scan, include, exclude)
+        shadows = [_scan_shadow_entry(s, s.match_strength) for s in scan.shadows]
+        if args.include_unmatched:
+            shadows += [_scan_shadow_entry(s, "other_template") for s in scan.other_template_shadows]
+            shadows += [_scan_shadow_entry(s, "unmatched") for s in scan.unmatched_shadows]
+        counts = dict(scan.counts)
+        counts.update(filtered_out=len(dropped), templates=len(scan.templates), listed=len(shadows))
+        doc.update(complete=scan.complete, shadows=shadows, counts=counts)
+        doc["errors"].extend(scan.errors)
+        doc["warnings"].extend(scan.warnings)
+        return EXIT_OK if scan.complete else EXIT_VCD
+
+    return _run_connected(args, stdout, doc, body, out_path=args.out)
+
+
+# ---- plan (offline) ----
+
+def plan_sha256(server: str, items: List[dict]) -> str:
+    """The plan hash: SHA-256 of canonical JSON of the host and the items, without names.
+
+    Canonical JSON: {"server": <host, lower-case, no scheme>, "items": [{"shadow_id",
+    "datastore_id", "template_id", "match_strength"}, ...] sorted by shadow_id}, dumped with
+    sort_keys=True and separators=(",", ":") (Python's default ensure_ascii), encoded as UTF-8.
+    """
+    canon_items = sorted(
+        ({k: str(i.get(k) or "") for k in ("shadow_id", "datastore_id", "template_id", "match_strength")}
+         for i in items),
+        key=lambda i: i["shadow_id"])
+    canon = {"server": normalize_host(server).lower(), "items": canon_items}
+    text = json.dumps(canon, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _load_scan_document(path: str) -> Tuple[dict, str]:
+    """Read and sanity-check a scan/1 document. Returns (doc, sha256 of the file bytes)."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise AgentUsageError([_usage_error(f"cannot read --scan file: {e.strerror or e}", target="--scan")])
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as e:
+        raise AgentUsageError([_usage_error(f"--scan file is not JSON: {e}", target="--scan")])
+    problems = []
+    if not isinstance(doc, dict) or doc.get("schema") != SCHEMA_SCAN:
+        problems.append(f"schema is not {SCHEMA_SCAN}")
+    else:
+        if not isinstance(doc.get("server"), str) or not doc.get("server"):
+            problems.append("server is missing")
+        if not isinstance(doc.get("shadows"), list) or not all(isinstance(s, dict) for s in doc["shadows"]):
+            problems.append("shadows is not a list of objects")
+        if not isinstance(doc.get("complete"), bool):
+            problems.append("complete is not true/false")
+    if problems:
+        raise AgentUsageError([_usage_error(f"--scan file is not a scan document: {'; '.join(problems)}",
+                                            target="--scan")])
+    return doc, hashlib.sha256(raw).hexdigest()
+
+
+def build_plan(scan_doc: dict, source_sha256: str, *, include_weak: bool = False, include=None,
+               exclude=None, limit: Optional[int] = None) -> dict:
+    """Turn a scan/1 document into a plan/1 document. Pure: no VCD calls, no side effects."""
+    include = [p for p in (include or []) if p]
+    exclude = [p for p in (exclude or []) if p]
+    server = scan_doc.get("server") or ""
+    entries = scan_doc.get("shadows") or []
+    complete = bool(scan_doc.get("complete"))
+    errors: List[dict] = []
+    warnings: List[str] = []
+    id_counts: dict = {}
+    for e in entries:
+        sid = str(e.get("id") or "")
+        id_counts[sid] = id_counts.get(sid, 0) + 1
+
+    eligible, excluded = [], []
+    for e in entries:
+        m = e.get("match") if isinstance(e.get("match"), dict) else {}
+        tpl = m.get("template") if isinstance(m.get("template"), dict) else {}
+        ds = e.get("datastore") if isinstance(e.get("datastore"), dict) else {}
+        strength = str(m.get("strength") or "")
+        sid = str(e.get("id") or "")
+        reasons = []
+        if not sid:
+            reasons.append("no_shadow_id")
+        elif id_counts.get(sid, 0) > 1:
+            reasons.append("duplicate_shadow_id")
+        if strength == "other_template":
+            reasons.append("other_template")
+        elif strength == "unmatched":
+            reasons.append("unmatched")
+        elif strength not in _MATCH_RANK:
+            reasons.append("unknown_match_strength")
+        else:
+            if strength in WEAK_MATCHES and not include_weak:
+                reasons.append("weak_match")
+            r = _template_filter_reason(str(tpl.get("name") or ""), include, exclude)
+            if r:
+                reasons.append(r)
+            if not tpl.get("id"):
+                reasons.append("no_template_id")
+            if not ds.get("id"):
+                reasons.append("no_datastore_id")
+        if strength in _MATCH_RANK and not complete:
+            reasons.append("source_scan_incomplete")
+        summary = {"shadow_id": sid, "shadow_name": str(e.get("name") or ""),
+                   "template_name": str(tpl.get("name") or ""), "match_strength": strength}
+        if reasons:
+            excluded.append(dict(summary, reasons=reasons))
+            continue
+        eligible.append({
+            "shadow_id": sid,
+            "datastore_id": str(ds.get("id") or ""),
+            "template_id": str(tpl.get("id") or ""),
+            "match_strength": strength,
+            "shadow_name": summary["shadow_name"],
+            "shadow_href": str(e.get("href") or ""),
+            "template_name": summary["template_name"],
+            "datastore_name": str(ds.get("name") or ""),
+            "ambiguous": bool(m.get("ambiguous_with")),
+        })
+
+    # --limit keeps exact matches first, then by shadow id, so it doesn't depend on input order.
+    eligible.sort(key=lambda i: (_MATCH_RANK[i["match_strength"]], i["shadow_id"]))
+    if limit is not None and len(eligible) > limit:
+        for i in eligible[limit:]:
+            excluded.append({"shadow_id": i["shadow_id"], "shadow_name": i["shadow_name"],
+                             "template_name": i["template_name"], "match_strength": i["match_strength"],
+                             "reasons": ["limit"]})
+        eligible = eligible[:limit]
+    items = sorted(eligible, key=lambda i: i["shadow_id"])
+    excluded.sort(key=lambda x: (x["shadow_id"], x["shadow_name"]))
+
+    if not complete:
+        errors.append({"type": "IncompleteScan", "stage": "plan", "target": "--scan", "http_status": None,
+                       "message": "the source scan is incomplete (complete: false); re-run the scan "
+                                  "until it completes. No plan was made."})
+        items = []
+    names = set()
+    for e in entries:
+        m = e.get("match")
+        if isinstance(m, dict) and isinstance(m.get("template"), dict) and m["template"].get("name"):
+            names.add(str(m["template"]["name"]))
+    for flag, patterns in (("--template", include), ("--exclude-template", exclude)):
+        for p in patterns:
+            if not any(_template_pattern_matches(n, p) for n in names):
+                warnings.append(f"{flag} '{p}' matches no template in the scan")
+    by_reason: dict = {}
+    for x in excluded:
+        for r in x["reasons"]:
+            by_reason[r] = by_reason.get(r, 0) + 1
+    return {
+        "schema": SCHEMA_PLAN,
+        "generated_at": _now_iso(),
+        "server": server,
+        "source_scan_sha256": source_sha256,
+        "filters": {"include_weak": bool(include_weak), "include": include, "exclude": exclude,
+                    "limit": limit},
+        "complete": complete,
+        "errors": errors,
+        "warnings": warnings,
+        "counts": {"items": len(items),
+                   "exact": sum(1 for i in items if i["match_strength"] == MATCH_EXACT),
+                   "weak": sum(1 for i in items if i["match_strength"] in WEAK_MATCHES),
+                   "excluded": len(excluded), "by_reason": by_reason},
+        "items": items,
+        "excluded": excluded,
+        "plan_sha256": plan_sha256(server, items) if complete else None,
+    }
+
+
+def _cmd_plan(args, stdout) -> int:
+    try:
+        scan_doc, source_sha = _load_scan_document(args.scan)
+    except AgentUsageError as e:
+        doc = {"schema": SCHEMA_PLAN, "generated_at": _now_iso(), "server": None,
+               "source_scan_sha256": None,
+               "filters": {"include_weak": bool(args.include_weak), "include": list(args.template or []),
+                           "exclude": list(args.exclude_template or []), "limit": args.limit},
+               "complete": False, "errors": e.errors, "warnings": [],
+               "counts": {"items": 0, "exact": 0, "weak": 0, "excluded": 0, "by_reason": {}},
+               "items": [], "excluded": [], "plan_sha256": None}
+        _report(doc, EXIT_USAGE)
+        _emit_document(doc, stdout, args.out)
+        return EXIT_USAGE
+    doc = build_plan(scan_doc, source_sha, include_weak=args.include_weak, include=args.template,
+                     exclude=args.exclude_template, limit=args.limit)
+    rc = EXIT_OK if doc["complete"] else EXIT_VCD
+    _report(doc, rc)
+    _emit_document(doc, stdout, args.out)
+    if doc["complete"]:
+        print(f"Plan {doc['plan_sha256']}: {doc['counts']['items']} item(s). Nothing was changed; "
+              f"hand the plan to a person to review.", file=sys.stderr)
+    return rc
+
+
+# ---- parser and dispatch ----
+
+def _positive_int(text: str) -> int:
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an integer: {text!r}")
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be 1 or more")
+    return n
+
+
+_AGENT_EPILOG = """\
+Exit codes: 0 success, results complete; 1 internal error; 2 usage error, or a name
+that doesn't resolve to exactly one object (the JSON lists the candidates with IDs);
+3 authentication failed; 4 VCD or network error, results incomplete (complete: false);
+130 interrupted. Secrets are read from a saved profile (OS keyring) or stdin, never argv.
+JSON Schemas: schemas/*.schema.json. Guide: docs/AGENTS.md.
+"""
+
+
+class _AgentArgumentParser(argparse.ArgumentParser):
+    """Usage errors never echo unrecognized arguments: one of them may be a secret."""
+
+    def error(self, message):
+        if message.startswith("unrecognized arguments:"):
+            message = "unrecognized arguments (not shown, in case one is a secret)"
+        super().error(message)
+
+
+def _build_agent_parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    common.add_argument("--debug", action="store_true", help="Debug logging on stderr")
+
+    conn = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    # Not accepted: caught so the error names the stdin flag without echoing the value.
+    conn.add_argument("--token", dest="argv_secret", nargs="?", const="", help=argparse.SUPPRESS)
+    conn.add_argument("--password", dest="argv_secret", nargs="?", const="", help=argparse.SUPPRESS)
+    g = conn.add_argument_group("connection (one of --profile or --server)")
+    g.add_argument("--profile", metavar="P",
+                   help="Saved server profile (id, display name or hostname; see 'profiles list'). "
+                        "Its credential comes from the OS keyring.")
+    g.add_argument("--server", metavar="HOST", help="VCD host, with --token-stdin or --username/--password-stdin")
+    g.add_argument("--token-stdin", action="store_true", help="Read the API token from the first line of stdin")
+    g.add_argument("--username", metavar="USER", help="Username, with --password-stdin")
+    g.add_argument("--password-stdin", action="store_true", help="Read the password from the first line of stdin")
+    g.add_argument("--skip-ssl-verify", action="store_true",
+                   help="With --server: skip TLS verification (a profile carries its own setting)")
+
+    parser = _AgentArgumentParser(
+        prog="vcd_shadow_cleaner.py",
+        description="Read-only analysis for scripts and AI agents. Each subcommand prints one "
+                    "JSON document on stdout; logs go to stderr. Nothing here can delete.",
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_AGENT_EPILOG, allow_abbrev=False)
+    sub = parser.add_subparsers(dest="command", metavar="SUBCOMMAND", required=True)
+
+    def add(name, help_text, parents):
+        sp = sub.add_parser(name, help=help_text, description=help_text, parents=parents,
+                            formatter_class=argparse.RawDescriptionHelpFormatter, epilog=_AGENT_EPILOG,
+                            allow_abbrev=False)
+        sp.set_defaults(_parser=sp)
+        return sp
+
+    sp = add("profiles", "Saved server profiles (credentials are never shown)", [common])
+    sp.add_argument("action", choices=["list"], help="list")
+    sp.set_defaults(_handler=_cmd_profiles, _connects=False)
+
+    sp = add("orgs", "List organizations (discovery/1)", [common, conn])
+    sp.set_defaults(_handler=_cmd_discovery, _connects=True)
+    sp = add("catalogs", "List catalogs with their IDs (discovery/1)", [common, conn])
+    sp.add_argument("--org", metavar="O", help="Only catalogs owned by or published to this org")
+    sp.set_defaults(_handler=_cmd_discovery, _connects=True)
+    sp = add("datastores", "List datastores with their IDs and vCenters (discovery/1)", [common, conn])
+    sp.set_defaults(_handler=_cmd_discovery, _connects=True)
+
+    sp = add("scan", "Scan datastores for shadow VMs of the catalogs' templates (scan/1)", [common, conn])
+    sp.add_argument("--catalog", action="append", metavar="NAME", help="Catalog name (repeatable)")
+    sp.add_argument("--catalog-id", action="append", metavar="ID", help="Catalog id or href (repeatable)")
+    sp.add_argument("--datastore", action="append", metavar="NAME", help="Datastore name (repeatable)")
+    sp.add_argument("--datastore-id", action="append", metavar="ID",
+                    help="Datastore id or href (repeatable); tells apart one name on several vCenters")
+    sp.add_argument("--org", metavar="O", help="Resolve catalog names within this org")
+    sp.add_argument("--template", action="append", metavar="NAME_OR_GLOB",
+                    help="Keep only shadows whose matched template fits (repeatable; case-sensitive glob)")
+    sp.add_argument("--exclude-template", action="append", metavar="NAME_OR_GLOB",
+                    help="Leave out shadows whose matched template fits (repeatable)")
+    sp.add_argument("--include-unmatched", action="store_true",
+                    help="Also list other_template and unmatched shadows")
+    sp.add_argument("--out", metavar="FILE", help="Write the document to FILE (mode 0600) instead of stdout")
+    sp.set_defaults(_handler=_cmd_scan, _connects=True)
+
+    sp = add("plan", "Make a plan/1 document from a scan/1 file, offline (no VCD calls; changes nothing)",
+             [common])
+    sp.add_argument("--scan", required=True, metavar="FILE", help="A scan/1 document")
+    sp.add_argument("--include-weak", action="store_true",
+                    help="Include name/substring matches (excluded by default)")
+    sp.add_argument("--template", action="append", metavar="NAME_OR_GLOB",
+                    help="Keep only items whose template fits (repeatable)")
+    sp.add_argument("--exclude-template", "--exclude", dest="exclude_template", action="append",
+                    metavar="NAME_OR_GLOB", help="Leave out items whose template fits (repeatable)")
+    sp.add_argument("--limit", type=_positive_int, metavar="N",
+                    help="At most N items (exact matches first, then by shadow id)")
+    sp.add_argument("--out", metavar="FILE", help="Write the document to FILE (mode 0600) instead of stdout")
+    sp.set_defaults(_handler=_cmd_plan, _connects=False)
+    return parser
+
+
+def _check_agent_args(args) -> None:
+    p = args._parser
+    if getattr(args, "_connects", False):
+        if getattr(args, "argv_secret", None) is not None:
+            p.error("secrets are never read from argv: use --token-stdin or --password-stdin "
+                    "(or a saved --profile)")
+        if bool(args.profile) == bool(args.server):
+            p.error("give exactly one of --profile or --server")
+        if args.profile:
+            if args.token_stdin or args.password_stdin or args.username or args.skip_ssl_verify:
+                p.error("--token-stdin, --username, --password-stdin and --skip-ssl-verify go with "
+                        "--server, not --profile")
+        else:
+            if args.token_stdin == bool(args.password_stdin or args.username):
+                p.error("with --server give --token-stdin, or --username with --password-stdin")
+            if bool(args.username) != bool(args.password_stdin):
+                p.error("--username and --password-stdin go together")
+    if args.command == "scan":
+        if not (args.catalog or args.catalog_id):
+            p.error("give at least one --catalog or --catalog-id")
+        if not (args.datastore or args.datastore_id):
+            p.error("give at least one --datastore or --datastore-id")
+    out = getattr(args, "out", None)
+    if out:
+        directory = os.path.dirname(os.path.abspath(out))
+        if not os.path.isdir(directory):
+            p.error(f"--out: directory {directory} does not exist")
+
+
+def run_agent(argv: List[str]) -> int:
+    """Run an analysis subcommand. stdout carries only the JSON document."""
+    parser = _build_agent_parser()
+    args = parser.parse_args(argv)
+    _check_agent_args(args)
+    if args.debug:
+        logging.basicConfig(level=logging.DEBUG, stream=sys.stderr,
+                            format="DEBUG %(name)s: %(message)s")
+    stdout = sys.stdout
+    try:
+        # Library code prints progress; keep it off stdout.
+        with contextlib.redirect_stdout(sys.stderr):
+            return args._handler(args, stdout)
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+        return EXIT_INTERRUPTED
+    except Exception as e:
+        print(f"INTERNAL ERROR: {type(e).__name__}: {e}", file=sys.stderr)
+        return EXIT_ERROR
 
 
 def run_gui(build_only: bool = False):
@@ -4126,6 +4971,12 @@ def run_gui(build_only: bool = False):
 
 
 def main():
+    # Agent analysis subcommands (read-only, JSON out). They read no VCD_* env vars and no
+    # .env file: the connection comes from --profile or --server plus stdin.
+    argv = sys.argv[1:]
+    if argv and argv[0] in AGENT_SUBCOMMANDS:
+        return run_agent(argv)
+
     # Load .env file if present
     load_env_file()
 
@@ -4174,6 +5025,14 @@ selected template) are deleted; --include-weak adds name/substring matches.
 Exit codes: 0 success; 1 internal/usage error; 2 catalog or datastore not found;
 3 authentication failed; 4 VCD or network error (results incomplete, nothing
 deleted); 5 delete refused (no terminal); 7 some deletes failed or were skipped.
+
+Read-only analysis subcommands for scripts and AI agents (JSON on stdout; nothing
+in them can delete; secrets from a saved profile or stdin, never argv):
+    profiles list
+    orgs|catalogs|datastores  --profile P | --server H (--token-stdin | --username U --password-stdin)
+    scan  --profile P (--catalog NAME | --catalog-id ID)... (--datastore NAME | --datastore-id ID)...
+    plan  --scan scan.json [--include-weak] [--limit N]
+Run "<subcommand> --help" for details; see docs/AGENTS.md.
         """
     )
 
@@ -4207,6 +5066,13 @@ deleted); 5 delete refused (no terminal); 7 some deletes failed or were skipped.
     parser.add_argument("--list-datastores", action="store_true",
                         help="Connect, list datastores, and exit. Implies --cli.")
 
+    parser.add_argument("--template", action="append", metavar="NAME_OR_GLOB",
+                        help="Keep only shadow VMs whose matched template name equals this, or fits it as a "
+                             "case-sensitive glob (*, ?, [..]). Repeatable. Applied after matching, so it never "
+                             "changes which template a shadow VM matched.")
+    parser.add_argument("--exclude-template", action="append", metavar="NAME_OR_GLOB",
+                        help="Leave out shadow VMs whose matched template name equals this, or fits it as a "
+                             "glob. Repeatable; applied after --template.")
     parser.add_argument("--dry-run", action="store_true", help="Show what would be deleted without making changes")
     parser.add_argument("--include-weak", action="store_true",
                         help="Also delete weak matches (found only by name or substring). By default only "

@@ -64,6 +64,11 @@ python vcd_shadow_cleaner.py
 
 The GUI will launch, allowing you to enter your VCD server details, authenticate, and then scan and clean up Shadow VMs.
 
+### Agent analysis subcommands
+
+Read-only subcommands for scripts and AI agents (`profiles list`, `orgs`, `catalogs`, `datastores`, `scan`, `plan`) print schema-versioned JSON and cannot delete.
+See [docs/AGENTS.md](docs/AGENTS.md) for the workflow, exit codes and schemas.
+
 ### CLI Mode
 
 Use the `--cli` flag along with the required arguments. Connection details can come from three places (in order of precedence): command-line arguments, environment variables (`VCD_SERVER`, `VCD_TOKEN`, `VCD_USER`, `VCD_PASSWORD`, `VCD_TENANT`, `VCD_CATALOG`, `VCD_DATASTORE`; a `.env` file is also supported), or a **saved server profile** created in the GUI (`--saved-server`).
@@ -144,6 +149,8 @@ It backs up `servers.json` to `servers.json.bak-<UTC timestamp>` (mode 0600), wr
     ```bash
     python vcd_shadow_cleaner.py --help
     ```
+
+`--template NAME_OR_GLOB` and `--exclude-template NAME_OR_GLOB` (repeatable; exact names or case-sensitive globs) limit the results, and so the deletes, to the shadow VMs of some templates, for example one of two template versions in the same catalog. They apply after matching, so they never move a shadow VM to another template.
 
 Multiple catalogs or datastores can be scanned in one run by passing comma-separated names to `--catalog` / `--datastore`. Names are resolved against the discovered catalogs (in `--tenant`'s org, when given) and datastores, so results stay scoped to that org and vCenter. During deletion the CLI pauses 3 seconds between VMs (same rate limiting as the GUI).
 

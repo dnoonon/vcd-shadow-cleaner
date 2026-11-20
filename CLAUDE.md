@@ -24,6 +24,10 @@ python vcd_shadow_cleaner.py --cli --saved-server "<profile_name>" \
     --catalog <catalog_name> --datastore <datastore_name> [--dry-run] [--json]
 
 # Discovery (each implies --cli): --list-servers, --list-tenants, --list-catalogs, --list-datastores
+# Limit results/deletes to some templates: --template NAME_OR_GLOB / --exclude-template NAME_OR_GLOB (repeatable)
+
+# Agent analysis subcommands (read-only, JSON on stdout; secrets via profile or stdin only)
+# profiles list | orgs | catalogs | datastores | scan | plan  -- see docs/AGENTS.md
 
 # Tests (offline, fake VCD session; the GUI test runs offscreen)
 venv/bin/python -m pytest -q tests
@@ -67,6 +71,8 @@ The entire application lives in a single file: `vcd_shadow_cleaner.py`. Tests li
 `run_gui(build_only=True)` returns the GUI classes without starting the app (used by the offscreen test).
 
 **`run_cli(args)`** — CLI wrapper around `VCDClient` + `scan_shadow_vms`; resolves catalog/datastore names via discovery (in `--tenant`'s org) before scanning.
+
+**`run_agent(argv)`** — the read-only analysis subcommands, dispatched from `main()` when `argv[0]` is in `AGENT_SUBCOMMANDS`. They use `ReadOnlyVCDClient` (GETs and the login POST only), write one document per run (schemas in `schemas/`, validated in `tests/test_agent_cli.py` by `tests/schema_check.py`), and `plan` (`build_plan()`, `plan_sha256()`) is offline. Guide: `docs/AGENTS.md`.
 
 ### VCD API endpoints used
 

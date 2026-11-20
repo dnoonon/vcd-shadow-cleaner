@@ -1,0 +1,476 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vcd-shadow-cleaner.scan/1",
+  "description": "Output of the 'scan' subcommand.",
+  "type": "object",
+  "required": [
+    "schema",
+    "generated_at",
+    "complete",
+    "errors",
+    "warnings",
+    "server",
+    "scope",
+    "counts",
+    "shadows"
+  ],
+  "properties": {
+    "schema": {
+      "const": "vcd-shadow-cleaner.scan/1"
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "true only when every query succeeded; exit 4 when false"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/error"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "server": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "scope": {
+      "type": "object",
+      "required": [
+        "org",
+        "catalogs",
+        "datastores",
+        "template_filter",
+        "include_unmatched"
+      ],
+      "properties": {
+        "org": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "catalogs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "href",
+              "org",
+              "org_href"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "href": {
+                "type": "string"
+              },
+              "org": {
+                "type": "string"
+              },
+              "org_href": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "datastores": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name",
+              "href",
+              "vcenter",
+              "vc"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "href": {
+                "type": "string"
+              },
+              "vcenter": {
+                "type": "string"
+              },
+              "vc": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "template_filter": {
+          "type": "object",
+          "required": [
+            "include",
+            "exclude"
+          ],
+          "properties": {
+            "include": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exclude": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "include_unmatched": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "counts": {
+      "type": "object",
+      "required": [
+        "exact",
+        "name",
+        "substring",
+        "weak",
+        "ambiguous",
+        "other_template",
+        "unmatched",
+        "filtered_out",
+        "templates",
+        "listed"
+      ],
+      "properties": {
+        "exact": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "name": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "substring": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "weak": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ambiguous": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "other_template": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unmatched": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "filtered_out": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "templates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "listed": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false,
+      "description": "exact..ambiguous count the listed matches after the template filter; filtered_out counts matches the filter left out; listed is len(shadows)."
+    },
+    "shadows": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/shadow"
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": [
+        "type",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "by": {
+          "enum": [
+            "name",
+            "id"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "ambiguous",
+            "not_found"
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "href": {
+                "type": "string"
+              },
+              "org": {
+                "type": "string"
+              },
+              "vcenter": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "description": "One failure. ResolutionError entries (exit 2) carry kind/query/by/reason and the candidates with their IDs."
+    },
+    "template": {
+      "type": "object",
+      "required": [
+        "id",
+        "name",
+        "href",
+        "catalog",
+        "org"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "href": {
+          "type": "string"
+        },
+        "catalog": {
+          "type": "string"
+        },
+        "org": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ambiguous": {
+      "type": "object",
+      "required": [
+        "template",
+        "catalog",
+        "href"
+      ],
+      "properties": {
+        "template": {
+          "type": "string"
+        },
+        "catalog": {
+          "type": "string"
+        },
+        "href": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": [
+        "rule"
+      ],
+      "properties": {
+        "rule": {
+          "enum": [
+            "parent_ref",
+            "parent_ref_not_selected",
+            "container_name",
+            "name_prefix",
+            "name_token",
+            "none"
+          ]
+        },
+        "field": {
+          "type": "string",
+          "description": "the raw record field the value came from"
+        },
+        "value": {
+          "type": "string"
+        },
+        "token": {
+          "type": "string",
+          "description": "the template name found in the value"
+        },
+        "template_href": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "shadow": {
+      "type": "object",
+      "required": [
+        "id",
+        "href",
+        "name",
+        "datastore",
+        "match",
+        "record"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "href": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "datastore": {
+          "type": "object",
+          "required": [
+            "id",
+            "name",
+            "href",
+            "vcenter"
+          ],
+          "properties": {
+            "id": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "href": {
+              "type": "string"
+            },
+            "vcenter": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "match": {
+          "type": "object",
+          "required": [
+            "strength",
+            "template",
+            "evidence",
+            "ambiguous_with"
+          ],
+          "properties": {
+            "strength": {
+              "enum": [
+                "exact",
+                "name",
+                "substring",
+                "other_template",
+                "unmatched"
+              ],
+              "description": "exact: the parent template reference is a selected template. name/substring are weak (names only). other_template/unmatched appear only with --include-unmatched."
+            },
+            "template": {
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/template"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "evidence": {
+              "$ref": "#/$defs/evidence"
+            },
+            "ambiguous_with": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/ambiguous"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "record": {
+          "type": "object",
+          "description": "the raw adminShadowVM query record"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,176 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vcd-shadow-cleaner.profiles/1",
+  "description": "Output of 'profiles list'. Credentials are never included.",
+  "type": "object",
+  "required": [
+    "schema",
+    "generated_at",
+    "complete",
+    "errors",
+    "warnings",
+    "counts",
+    "profiles"
+  ],
+  "properties": {
+    "schema": {
+      "const": "vcd-shadow-cleaner.profiles/1"
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "true only when every query succeeded; exit 4 when false"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/error"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "counts": {
+      "type": "object",
+      "required": [
+        "profiles"
+      ],
+      "properties": {
+        "profiles": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "profiles": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "server",
+          "auth_type",
+          "username",
+          "default_org",
+          "skip_ssl_verify"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "server": {
+            "type": "string"
+          },
+          "auth_type": {
+            "type": "string"
+          },
+          "username": {
+            "type": "string"
+          },
+          "default_org": {
+            "type": "string"
+          },
+          "skip_ssl_verify": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": [
+        "type",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "by": {
+          "enum": [
+            "name",
+            "id"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "ambiguous",
+            "not_found"
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "href": {
+                "type": "string"
+              },
+              "org": {
+                "type": "string"
+              },
+              "vcenter": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "description": "One failure. ResolutionError entries (exit 2) carry kind/query/by/reason and the candidates with their IDs."
+    }
+  }
+}

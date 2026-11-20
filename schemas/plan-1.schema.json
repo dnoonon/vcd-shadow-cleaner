@@ -1,0 +1,338 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vcd-shadow-cleaner.plan/1",
+  "description": "Output of the 'plan' subcommand (offline; changes nothing).",
+  "type": "object",
+  "required": [
+    "schema",
+    "generated_at",
+    "complete",
+    "errors",
+    "warnings",
+    "server",
+    "source_scan_sha256",
+    "filters",
+    "counts",
+    "items",
+    "excluded",
+    "plan_sha256"
+  ],
+  "properties": {
+    "schema": {
+      "const": "vcd-shadow-cleaner.plan/1"
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "true only when every query succeeded; exit 4 when false"
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/error"
+      }
+    },
+    "warnings": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "server": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "source_scan_sha256": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "SHA-256 of the scan file's bytes"
+    },
+    "filters": {
+      "type": "object",
+      "required": [
+        "include_weak",
+        "include",
+        "exclude",
+        "limit"
+      ],
+      "properties": {
+        "include_weak": {
+          "type": "boolean"
+        },
+        "include": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "counts": {
+      "type": "object",
+      "required": [
+        "items",
+        "exact",
+        "weak",
+        "excluded",
+        "by_reason"
+      ],
+      "properties": {
+        "items": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "exact": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "weak": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "excluded": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "by_reason": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/item"
+      },
+      "description": "sorted by shadow_id"
+    },
+    "excluded": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/excluded"
+      }
+    },
+    "plan_sha256": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "sha256 of json.dumps({'server': host.lower(), 'items': [{shadow_id, datastore_id, template_id, match_strength} sorted by shadow_id]}, sort_keys=True, separators=(',', ':')) as UTF-8. null when complete is false."
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "error": {
+      "type": "object",
+      "required": [
+        "type",
+        "message"
+      ],
+      "properties": {
+        "type": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        },
+        "target": {
+          "type": "string"
+        },
+        "http_status": {
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "message": {
+          "type": "string"
+        },
+        "server": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string"
+        },
+        "by": {
+          "enum": [
+            "name",
+            "id"
+          ]
+        },
+        "reason": {
+          "enum": [
+            "ambiguous",
+            "not_found"
+          ]
+        },
+        "candidates": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "id",
+              "name"
+            ],
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "name": {
+                "type": "string"
+              },
+              "href": {
+                "type": "string"
+              },
+              "org": {
+                "type": "string"
+              },
+              "vcenter": {
+                "type": "string"
+              },
+              "server": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false,
+      "description": "One failure. ResolutionError entries (exit 2) carry kind/query/by/reason and the candidates with their IDs."
+    },
+    "item": {
+      "type": "object",
+      "required": [
+        "shadow_id",
+        "datastore_id",
+        "template_id",
+        "match_strength",
+        "shadow_name",
+        "shadow_href",
+        "template_name",
+        "datastore_name",
+        "ambiguous"
+      ],
+      "properties": {
+        "shadow_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "datastore_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "template_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "match_strength": {
+          "enum": [
+            "exact",
+            "name",
+            "substring"
+          ]
+        },
+        "shadow_name": {
+          "type": "string"
+        },
+        "shadow_href": {
+          "type": "string"
+        },
+        "template_name": {
+          "type": "string"
+        },
+        "datastore_name": {
+          "type": "string"
+        },
+        "ambiguous": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "excluded": {
+      "type": "object",
+      "required": [
+        "shadow_id",
+        "shadow_name",
+        "template_name",
+        "match_strength",
+        "reasons"
+      ],
+      "properties": {
+        "shadow_id": {
+          "type": "string"
+        },
+        "shadow_name": {
+          "type": "string"
+        },
+        "template_name": {
+          "type": "string"
+        },
+        "match_strength": {
+          "type": "string"
+        },
+        "reasons": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "enum": [
+              "no_shadow_id",
+              "duplicate_shadow_id",
+              "other_template",
+              "unmatched",
+              "unknown_match_strength",
+              "weak_match",
+              "template_not_included",
+              "template_excluded",
+              "no_template_id",
+              "no_datastore_id",
+              "source_scan_incomplete",
+              "limit"
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
